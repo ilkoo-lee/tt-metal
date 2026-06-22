@@ -503,7 +503,7 @@ def test_indexer_score_determinism(device, case_id, heads):
 
 
 # Blackhole post-commit / sanity coverage reuses test_indexer_score_accuracy above: the CI entry in
-# tests/pipeline_reorg/ttnn-tests.yaml selects its sp_rank-7 GLM5.1/DSv32 cases via `-k "accuracy and
+# tests/pipeline_reorg/ttnn_sanity_tests.yaml selects its sp_rank-7 GLM5.1/DSv32 cases via `-k "accuracy and
 # rank7"`. No separate post-commit test (that would re-run the same cases under nightly); post-commit just
 # runs a subset of the nightly accuracy parametrization.
 
