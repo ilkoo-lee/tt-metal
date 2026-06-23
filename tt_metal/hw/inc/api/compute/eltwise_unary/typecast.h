@@ -12,6 +12,20 @@
 
 namespace ckernel {
 
+#ifdef ARCH_QUASAR
+namespace detail {
+// MX / block-float typecasts are a pure unpack/pack gasket conversion (a datacopy) on Quasar:
+// the unpacker converts MX -> float into Dest and the packer converts float -> MX on the way out,
+// so no SFPU op runs. This mirrors the BH "handled by unpacker/packer" no-op bfp arms.
+inline constexpr bool _typecast_is_mx_gasket_(DataFormat fmt) {
+    return fmt == DataFormat::MxFp8R || fmt == DataFormat::MxFp8P || fmt == DataFormat::MxFp6R ||
+           fmt == DataFormat::MxFp6P || fmt == DataFormat::MxFp4 || fmt == DataFormat::MxInt8 ||
+           fmt == DataFormat::MxInt4 || fmt == DataFormat::MxInt2 || fmt == DataFormat::MxFp4_2x_A ||
+           fmt == DataFormat::MxFp4_2x_B;
+}
+}  // namespace detail
+#endif
+
 // clang-format off
 /**
  * Performs an elementwise typecast operation on the input.
@@ -58,6 +72,20 @@ ALWI void typecast_tile(uint32_t idst) {
     constexpr DataFormat in_format = static_cast<DataFormat>(IN_DTYPE);
     constexpr DataFormat out_format = static_cast<DataFormat>(OUT_DTYPE);
 
+#ifdef ARCH_QUASAR
+    if constexpr (detail::_typecast_is_mx_gasket_(in_format) || detail::_typecast_is_mx_gasket_(out_format)) {
+        // No SFPU op: MX <-> float typecast is performed by the unpack/pack gasket (datacopy).
+    } else {
+        // Single unified Quasar typecast kernel, templated on the source/destination formats.
+        MATH(SFPU_UNARY_CALL(
+            DST_SYNC_MODE,
+            DST_ACCUM_MODE,
+            _calculate_typecast_,
+            (in_format, out_format, SFPU_ITERATIONS),
+            idst,
+            VectorMode::RC));
+    }
+#else
     if constexpr (in_format == DataFormat::Float16_b && out_format == DataFormat::UInt16) {
         MATH(SFPU_UNARY_CALL(
             DST_SYNC_MODE,
@@ -364,6 +392,7 @@ ALWI void typecast_tile(uint32_t idst) {
             idst,
             VectorMode::RC));
     }
+#endif  // ARCH_QUASAR
 }
 
 /**
@@ -374,6 +403,13 @@ ALWI void typecast_tile_init() {
     constexpr DataFormat in_format = static_cast<DataFormat>(IN_DTYPE);
     constexpr DataFormat out_format = static_cast<DataFormat>(OUT_DTYPE);
 
+#ifdef ARCH_QUASAR
+    if constexpr (detail::_typecast_is_mx_gasket_(in_format) || detail::_typecast_is_mx_gasket_(out_format)) {
+        // No SFPU init: MX <-> float typecast is a unpack/pack gasket conversion.
+    } else {
+        MATH((llk_math_eltwise_unary_sfpu_init<SfpuType::typecast>(sfpu::_init_typecast_)));
+    }
+#else
     if constexpr (in_format == DataFormat::Float32 && out_format == DataFormat::Float16_b) {
         MATH(SFPU_UNARY_INIT_FN(typecast, sfpu::init_typecast_fp32_to_fp16b, (APPROX)));
     } else if constexpr (
@@ -426,6 +462,7 @@ ALWI void typecast_tile_init() {
     } else {
         MATH(SFPU_UNARY_INIT(typecast));
     }
+#endif  // ARCH_QUASAR
 }
 
 }  // namespace ckernel
