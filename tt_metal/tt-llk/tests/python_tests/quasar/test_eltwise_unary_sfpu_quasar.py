@@ -484,6 +484,13 @@ _TYPECAST_PAIRS = (
     (DataFormat.Float32, DataFormat.UInt16),
     (DataFormat.UInt16, DataFormat.Int32),
     (DataFormat.UInt16, DataFormat.UInt8),
+    # Int16 (signed 16-bit) — not in the ttnn typecast matrix, but the kernel handles it on every
+    # path (float<->int16 via SFPCAST + 16-bit store-narrow, int16<->int via the int->int path), so
+    # it is swept here too. Mirrors the UInt16 set; Int16 has a native Quasar dest format.
+    (DataFormat.Float16_b, DataFormat.Int16),
+    (DataFormat.Float32, DataFormat.Int16),
+    (DataFormat.Int16, DataFormat.Int32),
+    (DataFormat.Int16, DataFormat.UInt8),
 )
 
 # Expand each unordered pair into both cast directions.
