@@ -54,6 +54,7 @@
 #else
 #include "ckernel_sfpu_sigmoid.h"
 #include "ckernel_sfpu_silu.h"
+#include "ckernel_sfpu_square.h"
 #include "llk_math_eltwise_unary_sfpu_macros.h"
 #include "llk_math_eltwise_binary_sfpu_binop.h"
 #include "llk_math_eltwise_binary_sfpu_add_int.h"
@@ -442,6 +443,7 @@ ALWI void sign_tile(uint32_t idst) {
  * Please refer to documentation for any_init.
  */
 ALWI void sign_tile_init() { MATH(SFPU_UNARY_INIT(sign)); }
+#endif  // !ARCH_QUASAR (square is available on Quasar; reopened after square_tile_init)
 
 // clang-format off
 /**
@@ -458,13 +460,24 @@ ALWI void sign_tile_init() { MATH(SFPU_UNARY_INIT(sign)); }
  */
 // clang-format on
 ALWI void square_tile(uint32_t idst) {
+#ifdef ARCH_QUASAR
+    MATH(SFPU_UNARY_CALL(DST_SYNC_MODE, DST_ACCUM_MODE, _calculate_square_, (SFPU_ITERATIONS), idst, VectorMode::RC));
+#else
     MATH(SFPU_UNARY_CALL(DST_SYNC_MODE, DST_ACCUM_MODE, calculate_square, (APPROX), idst, VectorMode::RC));
+#endif
 }
 
 /**
  * Please refer to documentation for any_init.
  */
-ALWI void square_tile_init() { MATH(SFPU_UNARY_INIT(square)); }
+ALWI void square_tile_init() {
+#ifdef ARCH_QUASAR
+    MATH((llk_math_eltwise_unary_sfpu_init<SfpuType::square>(sfpu::_init_square_)));
+#else
+    MATH(SFPU_UNARY_INIT(square));
+#endif
+}
+#ifndef ARCH_QUASAR
 
 // clang-format off
 /**
