@@ -460,10 +460,10 @@ ALWI void sign_tile_init() { MATH(SFPU_UNARY_INIT(sign)); }
  */
 // clang-format on
 ALWI void square_tile(uint32_t idst) {
-#ifdef ARCH_QUASAR
-    MATH(SFPU_UNARY_CALL(DST_SYNC_MODE, DST_ACCUM_MODE, _calculate_square_, (SFPU_ITERATIONS), idst, VectorMode::RC));
-#else
+#ifndef ARCH_QUASAR
     MATH(SFPU_UNARY_CALL(DST_SYNC_MODE, DST_ACCUM_MODE, calculate_square, (APPROX), idst, VectorMode::RC));
+#else
+    MATH(SFPU_UNARY_CALL(DST_SYNC_MODE, DST_ACCUM_MODE, _calculate_square_, (SFPU_ITERATIONS), idst, VectorMode::RC));
 #endif
 }
 
@@ -471,10 +471,10 @@ ALWI void square_tile(uint32_t idst) {
  * Please refer to documentation for any_init.
  */
 ALWI void square_tile_init() {
-#ifdef ARCH_QUASAR
-    MATH((llk_math_eltwise_unary_sfpu_init<SfpuType::square>(sfpu::_init_square_)));
-#else
+#ifndef ARCH_QUASAR
     MATH(SFPU_UNARY_INIT(square));
+#else
+    MATH((llk_math_eltwise_unary_sfpu_init<SfpuType::square>(sfpu::_init_square_)));
 #endif
 }
 #ifndef ARCH_QUASAR
