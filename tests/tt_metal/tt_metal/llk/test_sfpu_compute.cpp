@@ -1674,7 +1674,18 @@ INSTANTIATE_TEST_SUITE_P(
         std::make_tuple(tt::DataFormat::MxFp8P, tt::DataFormat::Float16_b),
         std::make_tuple(tt::DataFormat::Float16_b, tt::DataFormat::MxFp8P),
         std::make_tuple(tt::DataFormat::MxFp8R, tt::DataFormat::Float16_b),
-        std::make_tuple(tt::DataFormat::Float16_b, tt::DataFormat::MxFp8R)),
+        std::make_tuple(tt::DataFormat::Float16_b, tt::DataFormat::MxFp8R),
+        // MX <-> {Float32, Int32}: the MX endpoint behaves as Float16_b at the SFPU level, so these run
+        // the Float16_b <-> X conversion on top of the gasket. MX -> X runs; X -> MX is 32-bit input and
+        // is GTEST_SKIP'd until unpack-to-Dest is wired.
+        std::make_tuple(tt::DataFormat::MxFp8P, tt::DataFormat::Float32),
+        std::make_tuple(tt::DataFormat::MxFp8R, tt::DataFormat::Float32),
+        std::make_tuple(tt::DataFormat::Float32, tt::DataFormat::MxFp8P),
+        std::make_tuple(tt::DataFormat::Float32, tt::DataFormat::MxFp8R),
+        std::make_tuple(tt::DataFormat::MxFp8P, tt::DataFormat::Int32),
+        std::make_tuple(tt::DataFormat::MxFp8R, tt::DataFormat::Int32),
+        std::make_tuple(tt::DataFormat::Int32, tt::DataFormat::MxFp8P),
+        std::make_tuple(tt::DataFormat::Int32, tt::DataFormat::MxFp8R)),
     [](const testing::TestParamInfo<std::tuple<tt::DataFormat, tt::DataFormat>>& info) {
         return unit_tests::sfpu_util::typecast_device_format_name(std::get<0>(info.param)) + "_to_" +
                unit_tests::sfpu_util::typecast_device_format_name(std::get<1>(info.param));
