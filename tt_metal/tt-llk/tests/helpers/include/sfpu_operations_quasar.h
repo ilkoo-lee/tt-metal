@@ -87,6 +87,10 @@ void init_unary_sfpu_operation_quasar()
     {
         _init_zero_comp_();
     }
+    else if constexpr (OPERATION == SfpuType::typecast)
+    {
+        _init_typecast_();
+    }
 }
 
 /**

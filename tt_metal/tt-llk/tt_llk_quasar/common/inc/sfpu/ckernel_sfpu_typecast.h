@@ -5,6 +5,7 @@
 #pragma once
 
 #include <cstdint>
+#include <type_traits>
 
 #include "ckernel_ops.h"
 #include "ckernel_trisc_common.h"
@@ -16,22 +17,10 @@ namespace ckernel
 {
 namespace sfpu
 {
-// SFPCAST instr_mod1 selectors (assembly.yaml SFPCAST): pick the 32-bit cast direction.
-constexpr std::uint32_t SFPCAST_INT32_TO_FP32_RNE = 0x0; // int32 sign+mag -> fp32, round-nearest-even
-constexpr std::uint32_t SFPCAST_FP32_TO_INT32_RNE = 0x4; // fp32 -> int32, round-nearest-even
-
-// SFP_STOCH_RND instr_mod1 bit 3: use the immediate descale field in place of srcb (int narrowing).
-constexpr std::uint32_t STOCHRND_BIT_IMM_DESCALE = 1 << 3;
 
 // Compile-time format classification for the typecast datapath. In the SFPU register file a
 // float loads to fp32 and an int loads to sign-magnitude int32, so the conversion sequence is
 // picked from these classes, not from individual formats.
-template <DataFormat FMT>
-inline constexpr bool _typecast_is_float_()
-{
-    return FMT == DataFormat::Float16 || FMT == DataFormat::Float16_b || FMT == DataFormat::Float32 || FMT == DataFormat::Tf32;
-}
-
 template <DataFormat FMT>
 inline constexpr bool _typecast_is_fp16_()
 {
@@ -39,10 +28,9 @@ inline constexpr bool _typecast_is_fp16_()
 }
 
 template <DataFormat FMT>
-inline constexpr bool _typecast_is_int32_wide_()
+inline constexpr bool _typecast_is_float_()
 {
-    // Quasar's DataFormat enum has no UInt32; Int32 is the only 32-bit integer format.
-    return FMT == DataFormat::Int32;
+    return _typecast_is_fp16_<FMT>() || FMT == DataFormat::Float32 || FMT == DataFormat::Tf32;
 }
 
 template <DataFormat FMT>
@@ -57,136 +45,168 @@ inline constexpr bool _typecast_is_unsigned_int_()
     return FMT == DataFormat::UInt8 || FMT == DataFormat::UInt16;
 }
 
-// Emit the round-and-narrow instruction (fp32 -> narrow int, or int32 -> narrow int). UInt16 has
-// no _sfpu_stochround_conversion_ entry, so it uses the raw FP32_TO_UINT16 selector directly
-// (matches the legacy ckernel_sfpu_typecast_fp16b_uint16.h). The lreg indices are template
-// parameters because TTI_SFP_STOCH_RND encodes them as instruction immediates.
-template <DataFormat CAST_SRC_FMT, DataFormat DST_FMT, std::uint32_t LREG_IN, std::uint32_t LREG_OUT>
-inline void _typecast_stochrnd_narrow_()
+/**
+ * @brief Program the address mode the typecast op walks Dest with.
+ *
+ * Sets ADDR_MOD_6 to post-increment Dest by one SFPU pass (Quasar writes SFP_ROWS = 2 rows per
+ * pass), so the per-pass store advances Dest and the execute loop needs no separate increment.
+ *
+ * @note Call before @ref _calculate_typecast_, whose store walks Dest through ADDR_MOD_6.
+ */
+inline void _init_typecast_()
 {
-    constexpr std::uint32_t stochrnd_conv = []
-    {
-        if constexpr (DST_FMT == DataFormat::UInt16)
-        {
-            return p_sfpu::sfp_stochrnd_mod::FP32_TO_UINT16;
-        }
-        else
-        {
-            return ::_sfpu_stochround_conversion_<CAST_SRC_FMT, DST_FMT>();
-        }
-    }();
-    // The immediate-descale path is an int-narrowing feature; float -> fp16 narrowing does not
-    // use it (and must not, to keep the validated fp32 -> fp16 encoding unchanged).
-    constexpr std::uint32_t descale = _typecast_is_float_<DST_FMT>() ? 0u : STOCHRND_BIT_IMM_DESCALE;
-    TTI_SFP_STOCH_RND(
-        p_sfpu::sfp_stochrnd_rnd_mod::NearEven, 0 /* imm8_math */, 0 /* lreg_b: unused, descale via imm */, LREG_IN, LREG_OUT, descale | stochrnd_conv);
+    addr_mod_t {
+        .srca = {.incr = 0},
+        .srcb = {.incr = 0},
+        .dest = {.incr = ckernel::math::SFP_ROWS},
+    }
+        .set(ADDR_MOD_6, csr_read<CSR::TRISC_ID>());
 }
 
-// SFPU arithmetic cast: conversions the datapath cannot do, performed in the SFPU register file.
-// The (src,dst) classes select the load/store sfpmem modes and the bridge instruction(s):
-//   float->float : load; narrow via stochrnd (-> fp16) or widen with a plain store (-> fp32).
-//   float->int32 : load; SFPCAST fp32 -> int32.
-//   float->narrowint : load; clamp negatives (unsigned); stochrnd fp32 -> narrow int.
-//   int->float   : load; SFPCAST int32 -> fp32; narrow via stochrnd if the dst is fp16.
-//   int->int     : load; stochrnd to 8-bit, else width handled by the store sfpmem mode.
-// Note: MX / block-float typecasts are NOT handled here. Those are a pure unpack/pack gasket
-// format conversion (dest holds Float16_b after the unpack reconfig, and the pack reconfig
-// converts Float16_b -> MXFP8), i.e. a datacopy — they never route through this SFPU op.
-template <DataFormat SRC_FMT, DataFormat DST_FMT>
-inline void _calculate_typecast_arith_sfp_rows_()
+// Load one SFPU pass worth of rows from Dest as VTYPE (vFloat for floats, vSMag/vInt for ints —
+// ints load as sign-magnitude int32, and unsigned sources zero-extend so the sign-mag view stays
+// non-negative). The raw load builtin is used directly (rather than sfpi::dst_reg[].mode<>())
+// because the DataLayout abstraction has no encoding for UInt8 (sfpmem 0b1011) and no 8-bit Dest
+// operator on Quasar; the _sfpu_sfpmem_type_<FMT>() selector covers every typecast endpoint. The
+// load uses ADDR_MOD_7 (all-zeroes, no increment) — the paired store advances Dest via ADDR_MOD_6.
+// TODO: once DataLayout gains Int8/UInt8, load via sfpi::dst_reg[0].mode<...>() instead of the raw builtin.
+template <typename VTYPE, DataFormat FMT>
+inline VTYPE _typecast_load_()
 {
-    constexpr std::uint32_t sfpmem_src = ::_sfpu_sfpmem_type_<SRC_FMT>();
-    constexpr std::uint32_t sfpmem_dst = ::_sfpu_sfpmem_type_<DST_FMT>();
+    return VTYPE(__builtin_rvtt_sfpload(0 /* dest_reg */, _sfpu_sfpmem_type_<FMT>(), ADDR_MOD_7));
+}
 
-    constexpr bool src_float = _typecast_is_float_<SRC_FMT>();
-    constexpr bool dst_float = _typecast_is_float_<DST_FMT>();
+// ADDR_MOD_6 post-increments Dest by one SFPU pass (SFP_ROWS), so the store both writes the result
+// and advances to the next pair of rows — replacing the per-iteration _incr_counters_. Requires
+// _init_typecast_ to have programmed ADDR_MOD_6.
+// TODO: once DataLayout gains Int8/UInt8, store via sfpi::dst_reg[0].mode<...>() instead of the raw builtin.
+template <DataFormat FMT>
+inline void _typecast_store_(sfpi::impl_::vVal value)
+{
+    __builtin_rvtt_sfpstore(value.get(), 0 /* dest_reg */, _sfpu_sfpmem_type_<FMT>(), ADDR_MOD_6);
+}
 
-    TTI_SFPLOAD(p_sfpu::LREG0, sfpmem_src, ADDR_MOD_7, 0 /* done */, 0 /* dest_reg */);
+// fp32 -> sign-magnitude int32 (SFPCAST, round-nearest-even). The HW-valid FP32->SM32 mode (0x4)
+// is rejected by the current Quasar toolchain's sfpcast intrinsic immediate checker, so emit the
+// raw instruction: pin the value to a fixed lreg for the TTI op, then adopt the result back into
+// the sfpi value model. sfpreadlreg/sfpwritelreg are register bindings, not data moves, so this
+// lowers to a single SFPCAST — identical to the hand-written TTI baseline.
+inline sfpi::vSMag _typecast_fp32_to_smag_(sfpi::vFloat value)
+{
+    constexpr std::uint32_t SFPCAST_FP32_TO_INT32_RNE = 0x4;
+    sfpi::l_reg[sfpi::LRegs::LReg1]                   = value;
+    TTI_SFPCAST(p_sfpu::LREG1, p_sfpu::LREG1, SFPCAST_FP32_TO_INT32_RNE);
+    return sfpi::l_reg[sfpi::LRegs::LReg1];
+}
 
-    if constexpr (src_float && dst_float)
+// fp32 -> fp16 narrow, picking the fp16a/fp16b variant from the destination format. Round-nearest-
+// even matches the validated TTI encoding (the immediate-descale path is int-only and unused here).
+template <DataFormat DST_FMT>
+inline sfpi::vFloat _typecast_narrow_to_fp16_(sfpi::vFloat value)
+{
+    using fp16_t = std::conditional_t<DST_FMT == DataFormat::Float16, sfpi::vFloat16a, sfpi::vFloat16b>;
+    return sfpi::convert<fp16_t>(value, sfpi::RoundMode::NearestEven);
+}
+
+// sign-mag int32 -> 8-bit int round-and-narrow (the proven INT32_TO_(U)INT8 path), picking the
+// unsigned/signed variant from the destination format. Round-nearest-even matches the TTI baseline.
+template <DataFormat DST_FMT>
+inline auto _typecast_narrow_to_int8_(sfpi::vInt value)
+{
+    if constexpr (_typecast_is_unsigned_int_<DST_FMT>())
     {
-        // float -> float. Narrowing to fp16 rounds; widening to fp32 is just the store (the
-        // value already sits in LREG0 as fp32 after the load).
-        if constexpr (_typecast_is_fp16_<DST_FMT>())
-        {
-            _typecast_stochrnd_narrow_<DataFormat::Float32, DST_FMT, p_sfpu::LREG0, p_sfpu::LREG1>();
-        }
-    }
-    else if constexpr (src_float && !dst_float)
-    {
-        // float -> int. The direct fp32 -> narrow-int SFP_STOCH_RND modes (fp32->uint8/int8/
-        // uint16/int16) do not work on Quasar (they round to all-zeros), so compose two proven
-        // steps: SFPCAST fp32 -> int32, then narrow from int32 (int32->int8 SFP_STOCH_RND for an
-        // 8-bit dst, or the store sfpmem mode for a 16-bit dst).
-        //
-        // Clamp negatives to 0 first for unsigned targets, so the int32 the narrow sees is already
-        // non-negative. Mirror the relu pattern: gate on (x < 0) and zero those lanes with a
-        // CC-predicated SFPMAD (x*0 + 0). SFPLOADI is NOT CC-predicated, so it would zero EVERY lane
-        // (the all-zeros bug this replaces).
-        if constexpr (_typecast_is_unsigned_int_<DST_FMT>())
-        {
-            TTI_SFPSETCC(0 /* imm12 */, p_sfpu::LREG0, 0 /* mod1: CC_res <= LREG0 < 0 */);
-            TTI_SFPMAD(p_sfpu::LREG0, p_sfpu::LCONST_0, p_sfpu::LCONST_0, p_sfpu::LREG0, 0); // negatives -> 0
-            TTI_SFPENCC(0 /* imm12 */, 0 /* mod1: clear CC, re-enable all lanes */);
-        }
-        TTI_SFPCAST(p_sfpu::LREG0, p_sfpu::LREG1, SFPCAST_FP32_TO_INT32_RNE);
-        if constexpr (_typecast_is_int8_<DST_FMT>())
-        {
-            // 8-bit dst: int32 -> int8 round-and-narrow (the proven INT32_TO_(U)INT8 path).
-            _typecast_stochrnd_narrow_<DataFormat::Int32, DST_FMT, p_sfpu::LREG1, p_sfpu::LREG2>();
-        }
-        // Int32 and 16-bit dst: the value is already int32 in LREG1; for a 16-bit dst the store
-        // sfpmem mode performs the narrowing (matches the int->int path, e.g. Int32->UInt16).
-    }
-    else if constexpr (!src_float && dst_float)
-    {
-        // int -> float. SFPCAST yields fp32; a narrow fp16 dst then rounds fp32 -> fp16.
-        TTI_SFPCAST(p_sfpu::LREG0, p_sfpu::LREG1, SFPCAST_INT32_TO_FP32_RNE);
-        if constexpr (_typecast_is_fp16_<DST_FMT>())
-        {
-            _typecast_stochrnd_narrow_<DataFormat::Float32, DST_FMT, p_sfpu::LREG1, p_sfpu::LREG2>();
-        }
+        return sfpi::int32_to_uint8(value, 0u, sfpi::RoundMode::NearestEven);
     }
     else
     {
-        // int -> int. 8-bit dst rounds-and-narrows; wider/equal dst (incl. 16-bit narrowing) is
-        // handled by the store sfpmem mode, with the value already in LREG0 after the load.
+        return sfpi::int32_to_int8(value, 0u, sfpi::RoundMode::NearestEven);
+    }
+}
+
+// Convert one SFPU pass worth of rows from SRC_FMT to DST_FMT. The (src,dst) classes pick the
+// sequence (load to fp32 for floats, to sign-mag int32 for ints; store sfpmem mode sets the output):
+//   float->float : narrow via convert<fp16> (-> fp16), else store the loaded fp32 as-is.
+//   float->int   : convert<vSMag> fp32 -> sign-mag int32, then narrow to 8-bit / 16-bit if needed.
+//   int->float   : convert<vFloat> int32 -> fp32, then narrow via convert<fp16> for an fp16 dst.
+//   int->int     : narrow to 8-bit if needed, else the store sfpmem mode widens/narrows.
+template <DataFormat SRC_FMT, DataFormat DST_FMT>
+inline void _calculate_typecast_arith_sfp_rows_()
+{
+    constexpr bool src_float = _typecast_is_float_<SRC_FMT>();
+    constexpr bool dst_float = _typecast_is_float_<DST_FMT>();
+
+    if constexpr (src_float && dst_float)
+    {
+        sfpi::vFloat value = _typecast_load_<sfpi::vFloat, SRC_FMT>();
+        if constexpr (_typecast_is_fp16_<DST_FMT>())
+        {
+            value = _typecast_narrow_to_fp16_<DST_FMT>(value);
+        }
+        _typecast_store_<DST_FMT>(value);
+    }
+    else if constexpr (src_float && !dst_float)
+    {
+        // The direct fp32 -> narrow-int convert modes round to all-zeros on Quasar, so compose two
+        // proven steps: fp32 -> sign-mag int32, then narrow from int32. Clamp negatives to 0 first
+        // for unsigned targets (CC sign test predicates the zero-write) so the int32 is non-negative.
+        sfpi::vFloat value = _typecast_load_<sfpi::vFloat, SRC_FMT>();
+        if constexpr (_typecast_is_unsigned_int_<DST_FMT>())
+        {
+            v_if (value < 0.0f)
+            {
+                value = 0.0f;
+            }
+            v_endif;
+        }
+        sfpi::vSMag int_value = _typecast_fp32_to_smag_(value);
         if constexpr (_typecast_is_int8_<DST_FMT>())
         {
-            _typecast_stochrnd_narrow_<DataFormat::Int32, DST_FMT, p_sfpu::LREG0, p_sfpu::LREG1>();
-        }
-    }
-
-    // Result register selected at compile time per branch (no instruction is emitted for the
-    // pick): LREG0 for the no-cast stores, LREG2 for the int->fp16 two-step, else LREG1.
-    constexpr std::uint32_t result_lreg = []
-    {
-        if constexpr (src_float && dst_float)
-        {
-            return _typecast_is_fp16_<DST_FMT>() ? p_sfpu::LREG1 : p_sfpu::LREG0;
-        }
-        else if constexpr (src_float && !dst_float)
-        {
-            // 8-bit dst ends in LREG2 (SFPCAST -> LREG1, then int32->int8 narrow -> LREG2);
-            // Int32 and 16-bit dst end in LREG1 (the SFPCAST result, 16-bit narrowed by the store).
-            return _typecast_is_int8_<DST_FMT>() ? p_sfpu::LREG2 : p_sfpu::LREG1;
-        }
-        else if constexpr (!src_float && dst_float)
-        {
-            return _typecast_is_fp16_<DST_FMT>() ? p_sfpu::LREG2 : p_sfpu::LREG1;
+            _typecast_store_<DST_FMT>(_typecast_narrow_to_int8_<DST_FMT>(sfpi::as<sfpi::vInt>(int_value)));
         }
         else
         {
-            return _typecast_is_int8_<DST_FMT>() ? p_sfpu::LREG1 : p_sfpu::LREG0;
+            // Int32/16-bit dst: the store sfpmem mode narrows a 16-bit dst; int32 stores as-is.
+            _typecast_store_<DST_FMT>(int_value);
         }
-    }();
-
-    TTI_SFPSTORE(result_lreg, sfpmem_dst, ADDR_MOD_7, 0 /* done */, 0 /* dest_reg */);
+    }
+    else if constexpr (!src_float && dst_float)
+    {
+        sfpi::vSMag int_value    = _typecast_load_<sfpi::vSMag, SRC_FMT>();
+        sfpi::vFloat float_value = sfpi::convert<sfpi::vFloat>(int_value, sfpi::RoundMode::NearestEven);
+        if constexpr (_typecast_is_fp16_<DST_FMT>())
+        {
+            float_value = _typecast_narrow_to_fp16_<DST_FMT>(float_value);
+        }
+        _typecast_store_<DST_FMT>(float_value);
+    }
+    else
+    {
+        // 8-bit dst rounds-and-narrows; a 16-bit dst is narrowed by the store sfpmem mode.
+        sfpi::vInt value = _typecast_load_<sfpi::vInt, SRC_FMT>();
+        if constexpr (_typecast_is_int8_<DST_FMT>())
+        {
+            _typecast_store_<DST_FMT>(_typecast_narrow_to_int8_<DST_FMT>(value));
+        }
+        else
+        {
+            _typecast_store_<DST_FMT>(value);
+        }
+    }
 }
 
-// Parameterized SFPU typecast: performs the (src,dst) arithmetic cast in the SFPU register file.
-// MX / block-float typecasts are a pure unpack/pack gasket format conversion (a datacopy), so
-// they never reach this op; instantiating it with an MX endpoint is unsupported by design.
+/**
+ * @brief Cast a Dest tile in place from SRC_FMT to DST_FMT, element by element.
+ *
+ * Each loop pass converts one SFPU pass worth of rows (SFP_ROWS) and stores the result back to
+ * Dest through ADDR_MOD_6, which advances the Dest pointer — so no explicit increment is emitted.
+ * MX / block-float typecasts are a pure unpack/pack gasket conversion (a datacopy) and never reach
+ * this op; instantiating it with an MX endpoint is unsupported by design.
+ *
+ * @tparam SRC_FMT: Source data format (the format currently in Dest).
+ * @tparam DST_FMT: Destination data format to convert each element to.
+ * @tparam ITERATIONS: Number of SFPU passes (each covers SFP_ROWS rows) needed to span the tile.
+ * @note Call @ref _init_typecast_ first to program the ADDR_MOD_6 it stores through.
+ */
 template <DataFormat SRC_FMT, DataFormat DST_FMT, int ITERATIONS = SFPU_ITERATIONS>
 inline void _calculate_typecast_()
 {
@@ -194,7 +214,6 @@ inline void _calculate_typecast_()
     for (int d = 0; d < ITERATIONS; d++)
     {
         _calculate_typecast_arith_sfp_rows_<SRC_FMT, DST_FMT>();
-        ckernel::math::_incr_counters_<0x0, 0x0, ckernel::math::SFP_ROWS, 0x0>(); // does the dest_reg++ (increments by 2 rows)
     }
 }
 
