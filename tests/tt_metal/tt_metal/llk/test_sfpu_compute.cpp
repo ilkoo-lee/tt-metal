@@ -1291,8 +1291,12 @@ bool run_sfpu_typecast(
     auto packed_in = sfpu_util::typecast_pack(in_fmt, vals);
     auto golden = sfpu_util::typecast_golden(in_fmt, out_fmt, packed_in);
 
-    auto is_32bit = [](tt::DataFormat f) {
-        return f == tt::DataFormat::Float32 || f == tt::DataFormat::Int32 || f == tt::DataFormat::UInt32;
+    // A 32-bit Dest is required for any 32-bit endpoint and for every integer endpoint: the SFPU
+    // computes via a full-width int32 and 8/16-bit integer datums are kept as-is in a 32-bit Dest
+    // (matches the int8 matmul / UInt8 untilize references, which run with fp32_dest_acc_en=true).
+    auto needs_fp32_dest = [](tt::DataFormat f) {
+        return f == tt::DataFormat::Float32 || f == tt::DataFormat::Int32 || f == tt::DataFormat::UInt32 ||
+               f == tt::DataFormat::Int16 || f == tt::DataFormat::UInt8 || f == tt::DataFormat::Int8;
     };
 
     // typecast_tile_init<IN, OUT>() + typecast_tile<IN, OUT>(0), with the format pair baked into the
@@ -1305,9 +1309,8 @@ bool run_sfpu_typecast(
                              ")>";
     defines["SFPU_OP_CHAIN_0"] = "typecast_tile_init" + tmpl + "(); typecast_tile" + tmpl + "(0);";
 
-    // fp32_dest_acc_en is on whenever either endpoint is 32-bit (we convert into a 32-bit Dest at some
-    // point). The suite excludes 32-bit *inputs*, so no unpack_to_dest_mode entry is required: the
-    // metal2 validator gates that only on a CONSUMER Float32 DFB, and here Float32 is only ever output.
+    // No unpack_to_dest_mode entry is required: the metal2 validator gates that only on a CONSUMER
+    // Float32 DFB, and the suite skips 32-bit *inputs* (Float32 is only ever the output here).
     const CoreRange core_range({0, 0}, {0, 0});
     SfpuConfig cfg{
         .num_tiles = num_tiles,
@@ -1315,7 +1318,7 @@ bool run_sfpu_typecast(
         .l1_output_data_format = out_fmt,
         .cores = CoreRangeSet({core_range}),
         .approx_mode = false,
-        .en_32bit_dest = is_32bit(in_fmt) || is_32bit(out_fmt),
+        .en_32bit_dest = needs_fp32_dest(in_fmt) || needs_fp32_dest(out_fmt),
     };
 
     const auto dest = run_sfpu_pipeline(mesh_device, cfg, defines, packed_in);
@@ -1679,13 +1682,14 @@ INSTANTIATE_TEST_SUITE_P(
 // Int16 (SMAG16), UInt8, and MX (MxFp8P / MxFp8R). The compute API routes non-MX pairs through the
 // unified SFPU kernel; an MX endpoint behaves as Float16_b at the SFPU level (gasket).
 //
-// A conversion runs when its INPUT reaches Dest through copy_tile's SrcA/FPU datacopy — i.e. any
-// <=16-bit input (Float16_b, Int16, UInt8) or an MX input. A 32-bit OUTPUT is fine (the SFPU writes
-// the wide result into a 32-bit Dest). 32-bit *input* conversions (Float32->x, Int32->x) are listed
-// for visibility but GTEST_SKIP'd: a narrow FPU datacopy cannot land a 32-bit source into Dest (int
-// datacopy -> all-zeros / pipeline stall), so they need the unpack-to-Dest path copy_tile does not
-// yet wire on Quasar (see tt-llk quasar_unpack_to_dest). Drop the skip once that path is enabled.
-// fp32_dest_acc_en stays on whenever either endpoint is 32-bit.
+// A conversion runs only when its INPUT is Float16_b or MX — those reach Dest through copy_tile's
+// FPU/SrcA datacopy. An int endpoint forces a 32-bit Dest, and into a 32-bit Dest the FPU can neither
+// datacopy a 32-bit source nor unpack a narrow integer (Int16 in particular cannot be unpacked through
+// the FPU when Dest is 32-bit). Those would need the unpack-to-Dest path copy_tile does not yet wire on
+// Quasar (see tt-llk quasar_unpack_to_dest), so every non-Float16_b/non-MX input is GTEST_SKIP'd.
+// OUTPUTs are wider: Float32/Int32/Int16 and MX outputs all work; UInt8 output is still skipped (its
+// 8-bit pack path corrupts bytes even with a 32-bit Dest). fp32_dest_acc_en is on for any int/fp32
+// endpoint (8/16-bit integer datums are kept as-is in a 32-bit Dest, per the int8/UInt8 references).
 class SingleCoreSingleMeshDeviceSfpuTypecastFixture
     : public LLKMeshDeviceFixture,
       public testing::WithParamInterface<std::tuple<tt::DataFormat, tt::DataFormat>> {};
@@ -1698,24 +1702,18 @@ TEST_P(SingleCoreSingleMeshDeviceSfpuTypecastFixture, TensixSfpuTypecast) {
         GTEST_SKIP() << "Typecast compute-API test is currently Quasar-only";
     }
 
-    // 32-bit input needs unpack-to-Dest (a narrow FPU datacopy cannot land a 32-bit source into a
-    // 32-bit Dest: int datacopy -> all-zeros / pipeline stall). copy_tile does not yet wire the
-    // unpack-to-Dest path on Quasar, so these pairs are listed for visibility but skipped for now.
-    if (in_fmt == tt::DataFormat::Float32 || in_fmt == tt::DataFormat::Int32) {
-        GTEST_SKIP() << "32-bit input typecast needs unpack-to-Dest, not yet wired in copy_tile";
+    // Only Float16_b and MX inputs reach Dest correctly via copy_tile's FPU/SrcA datacopy. Int
+    // typecasts force a 32-bit Dest, and into a 32-bit Dest the FPU can neither datacopy a 32-bit
+    // source nor unpack a narrow integer (e.g. Int16 cannot be unpacked through the FPU when Dest is
+    // 32-bit) -- both need the unpack-to-Dest path that copy_tile does not yet wire on Quasar. So any
+    // input other than Float16_b / MX is listed for visibility but skipped. (Int16/MX OUTPUT works.)
+    if (in_fmt != tt::DataFormat::Float16_b && !unit_tests::sfpu_util::typecast_is_mx(in_fmt)) {
+        GTEST_SKIP() << "only Float16_b/MX inputs reach Dest via copy_tile; others need unpack-to-Dest";
     }
 
-    // UInt8 narrow-format pack path emits corrupted bytes through the metal compute API (the SFPU
-    // kernel itself is validated by tt-llk). Skip until the 8-bit output pack path is fixed.
-    if (in_fmt == tt::DataFormat::UInt8 || out_fmt == tt::DataFormat::UInt8) {
-        GTEST_SKIP() << "UInt8 narrow-format pack/unpack not yet correct in the metal compute path";
-    }
-
-    // Int16 has no fp32->Int16 entry in the metal pack format tables, so any program with an Int16
-    // buffer fails to build (get_pack_src_formats throws "No valid conversion ... = Int16"). Skip
-    // until the pack table gains Int16.
-    if (in_fmt == tt::DataFormat::Int16 || out_fmt == tt::DataFormat::Int16) {
-        GTEST_SKIP() << "Int16 is not a supported pack-src format in the metal format tables";
+    // UInt8 output: the 8-bit-output pack path still emits corrupted bytes even with a 32-bit Dest.
+    if (out_fmt == tt::DataFormat::UInt8) {
+        GTEST_SKIP() << "UInt8 output pack path corrupts bytes (even with fp32_dest_acc_en)";
     }
 
     log_info(
