@@ -343,8 +343,15 @@ bool is_close_packed_sfpu_output(
 // destination encoding's quantization so it matches what the packer produces.
 
 inline bool typecast_is_mx(tt::DataFormat fmt) {
-    return fmt == tt::DataFormat::MxFp8R || fmt == tt::DataFormat::MxFp8P;
+    return fmt == tt::DataFormat::MxFp8R || fmt == tt::DataFormat::MxFp8P || fmt == tt::DataFormat::MxFp4;
 }
+
+// Integer endpoints whose value compares exactly (and that the SFPU round-to-nearest produces).
+inline bool typecast_is_int(tt::DataFormat fmt) {
+    return fmt == tt::DataFormat::Int32 || fmt == tt::DataFormat::Int16 || fmt == tt::DataFormat::UInt8;
+}
+
+inline bool typecast_is_unsigned(tt::DataFormat fmt) { return fmt == tt::DataFormat::UInt8; }
 
 // Device-side ckernel::DataFormat enum NAME (the kernel chain references formats by name, since the
 // compute kernel compiles against the device enum whose values differ from the host tt::DataFormat).
@@ -353,8 +360,11 @@ inline std::string typecast_device_format_name(tt::DataFormat fmt) {
         case tt::DataFormat::Float16_b: return "Float16_b";
         case tt::DataFormat::Float32: return "Float32";
         case tt::DataFormat::Int32: return "Int32";
+        case tt::DataFormat::Int16: return "Int16";
+        case tt::DataFormat::UInt8: return "UInt8";
         case tt::DataFormat::MxFp8R: return "MxFp8R";
         case tt::DataFormat::MxFp8P: return "MxFp8P";
+        case tt::DataFormat::MxFp4: return "MxFp4";
         default: TT_THROW("typecast test: unsupported format {}", static_cast<int>(fmt));
     }
 }
@@ -381,8 +391,30 @@ inline std::vector<uint32_t> typecast_pack(tt::DataFormat fmt, const std::vector
             }
             return out;
         }
+        case tt::DataFormat::Int16: {
+            // Quasar Int16 in L1 is sign-magnitude 16-bit (SMAG16): sign in bit 15, 14-bit magnitude;
+            // two elements packed per 32-bit word (element 2i in the low half, 2i+1 in the high half).
+            std::vector<uint32_t> out((vals.size() + 1) / 2, 0);
+            for (size_t i = 0; i < vals.size(); ++i) {
+                const int32_t s = static_cast<int32_t>(std::lround(vals[i]));
+                const uint16_t enc =
+                    static_cast<uint16_t>((s < 0 ? 0x8000u : 0u) | (static_cast<uint32_t>(std::abs(s)) & 0x7fffu));
+                out[i / 2] |= static_cast<uint32_t>(enc) << (16 * (i % 2));
+            }
+            return out;
+        }
+        case tt::DataFormat::UInt8: {
+            // UInt8 in L1 is raw unsigned bytes (four per 32-bit word).
+            std::vector<uint32_t> out((vals.size() + 3) / 4, 0);
+            for (size_t i = 0; i < vals.size(); ++i) {
+                const int32_t s = std::clamp<int32_t>(static_cast<int32_t>(std::lround(vals[i])), 0, 255);
+                out[i / 4] |= static_cast<uint32_t>(s & 0xff) << (8 * (i % 4));
+            }
+            return out;
+        }
         case tt::DataFormat::MxFp8R:
-        case tt::DataFormat::MxFp8P: return pack_as_mx_tiles(fmt, vals, /*row_major_input=*/false);
+        case tt::DataFormat::MxFp8P:
+        case tt::DataFormat::MxFp4: return pack_as_mx_tiles(fmt, vals, /*row_major_input=*/false);
         default: TT_THROW("typecast test: unsupported pack format {}", static_cast<int>(fmt));
     }
 }
@@ -414,17 +446,37 @@ inline std::vector<float> typecast_decode(tt::DataFormat fmt, const std::vector<
             }
             return out;
         }
+        case tt::DataFormat::Int16: {
+            std::vector<float> out(bytes.size() * 2);
+            for (size_t i = 0; i < out.size(); ++i) {
+                const uint16_t h = static_cast<uint16_t>(bytes[i / 2] >> (16 * (i % 2)));
+                const int32_t mag = h & 0x7fff;
+                out[i] = static_cast<float>((h & 0x8000) ? -mag : mag);
+            }
+            return out;
+        }
+        case tt::DataFormat::UInt8: {
+            std::vector<float> out(bytes.size() * 4);
+            for (size_t i = 0; i < out.size(); ++i) {
+                out[i] = static_cast<float>((bytes[i / 4] >> (8 * (i % 4))) & 0xffu);
+            }
+            return out;
+        }
         case tt::DataFormat::MxFp8R:
-        case tt::DataFormat::MxFp8P: return mx_to_floats(fmt, bytes, /*row_major_output=*/false);
+        case tt::DataFormat::MxFp8P:
+        case tt::DataFormat::MxFp4: return mx_to_floats(fmt, bytes, /*row_major_output=*/false);
         default: TT_THROW("typecast test: unsupported decode format {}", static_cast<int>(fmt));
     }
 }
 
-// Whole-number stimulus: small magnitudes when an MX endpoint is involved (MX block-float steps),
-// wider signed range otherwise (still bf16-exact so float<->int is lossless).
-inline std::vector<float> generate_typecast_input(size_t numel, int seed, bool mx) {
-    const float lo = mx ? 0.0f : -64.0f;
-    const float hi = mx ? 8.0f : 64.0f;
+// Whole-number stimulus, range chosen so every endpoint represents it losslessly: small magnitudes
+// for MX (block-float steps), non-negative for an unsigned endpoint (UInt8), wider signed otherwise.
+inline std::vector<float> generate_typecast_input(
+    size_t numel, int seed, tt::DataFormat in_fmt, tt::DataFormat out_fmt) {
+    const bool mx = typecast_is_mx(in_fmt) || typecast_is_mx(out_fmt);
+    const bool has_unsigned = typecast_is_unsigned(in_fmt) || typecast_is_unsigned(out_fmt);
+    const float lo = (mx || has_unsigned) ? 0.0f : -64.0f;
+    const float hi = mx ? 8.0f : (has_unsigned ? 32.0f : 64.0f);
     auto packed = generate_packed_uniform_random_vector<uint32_t, bfloat16>(lo, hi, numel, seed);
     auto bf = unpack_vector<bfloat16, uint32_t>(packed);
     std::vector<float> out(bf.size());
@@ -439,9 +491,12 @@ inline std::vector<float> typecast_golden(
     tt::DataFormat in_fmt, tt::DataFormat out_fmt, const std::vector<uint32_t>& packed_in) {
     // Effective source = what the SRC encoding actually represents (after any input quantization).
     std::vector<float> golden = typecast_decode(in_fmt, packed_in);
-    if (out_fmt == tt::DataFormat::Int32) {
+    if (typecast_is_int(out_fmt)) {
         for (auto& v : golden) {
             v = static_cast<float>(std::lround(v));  // float->int rounds to nearest
+            if (typecast_is_unsigned(out_fmt)) {
+                v = std::max(v, 0.0f);  // unsigned dst clamps negatives to 0 (matches the SFPU)
+            }
         }
     }
     // Fold in the destination encoding's quantization so the golden matches what the packer emits.
@@ -455,7 +510,7 @@ inline bool typecast_compare(tt::DataFormat out_fmt, const std::vector<float>& g
     if (got.size() != want.size()) {
         return false;
     }
-    const bool exact = (out_fmt == tt::DataFormat::Int32);
+    const bool exact = typecast_is_int(out_fmt);
     const float rtol = typecast_is_mx(out_fmt) ? 0.1f : 0.05f;
     const float atol = typecast_is_mx(out_fmt) ? 0.1f : 0.05f;
     for (size_t i = 0; i < got.size(); ++i) {
@@ -1234,9 +1289,8 @@ bool run_sfpu_typecast(
     tt::DataFormat out_fmt,
     size_t num_tiles) {
     const size_t numel = num_tiles * 32 * 32;
-    const bool mx = sfpu_util::typecast_is_mx(in_fmt) || sfpu_util::typecast_is_mx(out_fmt);
     const int seed = std::chrono::system_clock::now().time_since_epoch().count();
-    auto vals = sfpu_util::generate_typecast_input(numel, seed, mx);
+    auto vals = sfpu_util::generate_typecast_input(numel, seed, in_fmt, out_fmt);
     auto packed_in = sfpu_util::typecast_pack(in_fmt, vals);
     auto golden = sfpu_util::typecast_golden(in_fmt, out_fmt, packed_in);
 
@@ -1622,17 +1676,19 @@ INSTANTIATE_TEST_SUITE_P(
         return std::get<1>(info.param) + "_" + std::to_string(std::get<0>(info.param)) + "tiles";
     });
 
-// Typecast (data-conversion) test fixture. Each instance is one (in_format -> out_format) pair.
-// Quasar-only: the typecast compute API is wired through the single unified Quasar SFPU kernel
-// (and the unpack/pack gasket for MX <-> float).
+// Typecast (data-conversion) test fixture. Each instance is one (in_format -> out_format) pair,
+// covering the documented Quasar typecast matrix (block-float endpoints are the MX formats here;
+// UInt16 is replaced by Int16, and UInt32 is out of scope). Endpoints: Float16_b, Float32, Int32,
+// Int16 (SMAG16), UInt8, and MX (MxFp8P / MxFp8R / MxFp4). The compute API routes non-MX pairs
+// through the unified SFPU kernel; an MX endpoint behaves as Float16_b at the SFPU level (gasket).
 //
-// Conversions whose INPUT reaches Dest through copy_tile's SrcA/FPU datacopy — 16-bit (Float16_b)
-// and MX inputs — run for real. A 32-bit OUTPUT is fine (the SFPU writes the wide result into a
-// 32-bit Dest), so Float16_b->Float32 / Float16_b->Int32 are covered. 32-bit *input* conversions
-// (Float32->x, Int32->x) are listed too but GTEST_SKIP'd in the body: a narrow FPU datacopy cannot
-// land a 32-bit source into Dest (int datacopy -> all-zeros / pipeline stall), so they need the
-// unpack-to-Dest path that copy_tile does not yet wire on Quasar (see tt-llk quasar_unpack_to_dest).
-// Drop the skip once that path is enabled. fp32_dest_acc_en stays on whenever either endpoint is 32-bit.
+// A conversion runs when its INPUT reaches Dest through copy_tile's SrcA/FPU datacopy — i.e. any
+// <=16-bit input (Float16_b, Int16, UInt8) or an MX input. A 32-bit OUTPUT is fine (the SFPU writes
+// the wide result into a 32-bit Dest). 32-bit *input* conversions (Float32->x, Int32->x) are listed
+// for visibility but GTEST_SKIP'd: a narrow FPU datacopy cannot land a 32-bit source into Dest (int
+// datacopy -> all-zeros / pipeline stall), so they need the unpack-to-Dest path copy_tile does not
+// yet wire on Quasar (see tt-llk quasar_unpack_to_dest). Drop the skip once that path is enabled.
+// fp32_dest_acc_en stays on whenever either endpoint is 32-bit.
 class SingleCoreSingleMeshDeviceSfpuTypecastFixture
     : public LLKMeshDeviceFixture,
       public testing::WithParamInterface<std::tuple<tt::DataFormat, tt::DataFormat>> {};
@@ -1666,26 +1722,60 @@ INSTANTIATE_TEST_SUITE_P(
     SingleCoreSfpuTypecast,
     SingleCoreSingleMeshDeviceSfpuTypecastFixture,
     ::testing::Values(
+        // --- Float16_b <-> {Float32, Int32, Int16, UInt8} (X->Float16_b with 32-bit X is skipped) ---
         std::make_tuple(tt::DataFormat::Float16_b, tt::DataFormat::Float32),
-        std::make_tuple(tt::DataFormat::Float16_b, tt::DataFormat::Int32),
-        // 32-bit inputs: listed for visibility, GTEST_SKIP'd until unpack-to-Dest is wired.
         std::make_tuple(tt::DataFormat::Float32, tt::DataFormat::Float16_b),
+        std::make_tuple(tt::DataFormat::Float16_b, tt::DataFormat::Int32),
         std::make_tuple(tt::DataFormat::Int32, tt::DataFormat::Float16_b),
+        std::make_tuple(tt::DataFormat::Float16_b, tt::DataFormat::Int16),
+        std::make_tuple(tt::DataFormat::Int16, tt::DataFormat::Float16_b),
+        std::make_tuple(tt::DataFormat::Float16_b, tt::DataFormat::UInt8),
+        std::make_tuple(tt::DataFormat::UInt8, tt::DataFormat::Float16_b),
+        // --- Float32 <-> {Int32, Int16, UInt8} (Float32-input directions skipped) ---
+        std::make_tuple(tt::DataFormat::Float32, tt::DataFormat::Int32),
+        std::make_tuple(tt::DataFormat::Int32, tt::DataFormat::Float32),
+        std::make_tuple(tt::DataFormat::Float32, tt::DataFormat::Int16),
+        std::make_tuple(tt::DataFormat::Int16, tt::DataFormat::Float32),
+        std::make_tuple(tt::DataFormat::Float32, tt::DataFormat::UInt8),
+        std::make_tuple(tt::DataFormat::UInt8, tt::DataFormat::Float32),
+        // --- Int16 <-> Int32 ---
+        std::make_tuple(tt::DataFormat::Int16, tt::DataFormat::Int32),
+        std::make_tuple(tt::DataFormat::Int32, tt::DataFormat::Int16),
+        // --- MxFp8P <-> {Float16_b, Float32, Int32, Int16, UInt8} (X->MX with 32-bit X is skipped) ---
         std::make_tuple(tt::DataFormat::MxFp8P, tt::DataFormat::Float16_b),
         std::make_tuple(tt::DataFormat::Float16_b, tt::DataFormat::MxFp8P),
+        std::make_tuple(tt::DataFormat::MxFp8P, tt::DataFormat::Float32),
+        std::make_tuple(tt::DataFormat::Float32, tt::DataFormat::MxFp8P),
+        std::make_tuple(tt::DataFormat::MxFp8P, tt::DataFormat::Int32),
+        std::make_tuple(tt::DataFormat::Int32, tt::DataFormat::MxFp8P),
+        std::make_tuple(tt::DataFormat::MxFp8P, tt::DataFormat::Int16),
+        std::make_tuple(tt::DataFormat::Int16, tt::DataFormat::MxFp8P),
+        std::make_tuple(tt::DataFormat::MxFp8P, tt::DataFormat::UInt8),
+        std::make_tuple(tt::DataFormat::UInt8, tt::DataFormat::MxFp8P),
+        // --- MxFp8R <-> {Float16_b, Float32, Int32, Int16, UInt8} ---
         std::make_tuple(tt::DataFormat::MxFp8R, tt::DataFormat::Float16_b),
         std::make_tuple(tt::DataFormat::Float16_b, tt::DataFormat::MxFp8R),
-        // MX <-> {Float32, Int32}: the MX endpoint behaves as Float16_b at the SFPU level, so these run
-        // the Float16_b <-> X conversion on top of the gasket. MX -> X runs; X -> MX is 32-bit input and
-        // is GTEST_SKIP'd until unpack-to-Dest is wired.
-        std::make_tuple(tt::DataFormat::MxFp8P, tt::DataFormat::Float32),
         std::make_tuple(tt::DataFormat::MxFp8R, tt::DataFormat::Float32),
-        std::make_tuple(tt::DataFormat::Float32, tt::DataFormat::MxFp8P),
         std::make_tuple(tt::DataFormat::Float32, tt::DataFormat::MxFp8R),
-        std::make_tuple(tt::DataFormat::MxFp8P, tt::DataFormat::Int32),
         std::make_tuple(tt::DataFormat::MxFp8R, tt::DataFormat::Int32),
-        std::make_tuple(tt::DataFormat::Int32, tt::DataFormat::MxFp8P),
-        std::make_tuple(tt::DataFormat::Int32, tt::DataFormat::MxFp8R)),
+        std::make_tuple(tt::DataFormat::Int32, tt::DataFormat::MxFp8R),
+        std::make_tuple(tt::DataFormat::MxFp8R, tt::DataFormat::Int16),
+        std::make_tuple(tt::DataFormat::Int16, tt::DataFormat::MxFp8R),
+        std::make_tuple(tt::DataFormat::MxFp8R, tt::DataFormat::UInt8),
+        std::make_tuple(tt::DataFormat::UInt8, tt::DataFormat::MxFp8R),
+        // --- MxFp4 <-> {Float16_b, Float32, Int32, Int16, UInt8, MxFp8P} ---
+        std::make_tuple(tt::DataFormat::MxFp4, tt::DataFormat::Float16_b),
+        std::make_tuple(tt::DataFormat::Float16_b, tt::DataFormat::MxFp4),
+        std::make_tuple(tt::DataFormat::MxFp4, tt::DataFormat::Float32),
+        std::make_tuple(tt::DataFormat::Float32, tt::DataFormat::MxFp4),
+        std::make_tuple(tt::DataFormat::MxFp4, tt::DataFormat::Int32),
+        std::make_tuple(tt::DataFormat::Int32, tt::DataFormat::MxFp4),
+        std::make_tuple(tt::DataFormat::MxFp4, tt::DataFormat::Int16),
+        std::make_tuple(tt::DataFormat::Int16, tt::DataFormat::MxFp4),
+        std::make_tuple(tt::DataFormat::MxFp4, tt::DataFormat::UInt8),
+        std::make_tuple(tt::DataFormat::UInt8, tt::DataFormat::MxFp4),
+        std::make_tuple(tt::DataFormat::MxFp4, tt::DataFormat::MxFp8P),
+        std::make_tuple(tt::DataFormat::MxFp8P, tt::DataFormat::MxFp4)),
     [](const testing::TestParamInfo<std::tuple<tt::DataFormat, tt::DataFormat>>& info) {
         return unit_tests::sfpu_util::typecast_device_format_name(std::get<0>(info.param)) + "_to_" +
                unit_tests::sfpu_util::typecast_device_format_name(std::get<1>(info.param));
