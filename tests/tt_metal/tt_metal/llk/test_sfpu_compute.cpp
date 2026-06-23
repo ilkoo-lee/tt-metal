@@ -1626,13 +1626,13 @@ INSTANTIATE_TEST_SUITE_P(
 // Quasar-only: the typecast compute API is wired through the single unified Quasar SFPU kernel
 // (and the unpack/pack gasket for MX <-> float).
 //
-// Scope: only conversions whose INPUT reaches Dest through copy_tile's SrcA/FPU datacopy — i.e.
-// 16-bit (Float16_b) and MX inputs. A 32-bit OUTPUT is fine (the SFPU writes the wide result into a
+// Conversions whose INPUT reaches Dest through copy_tile's SrcA/FPU datacopy — 16-bit (Float16_b)
+// and MX inputs — run for real. A 32-bit OUTPUT is fine (the SFPU writes the wide result into a
 // 32-bit Dest), so Float16_b->Float32 / Float16_b->Int32 are covered. 32-bit *input* conversions
-// (Float32->x, Int32->x) are intentionally excluded: a narrow FPU datacopy cannot land a 32-bit
-// source into Dest (int datacopy -> all-zeros / pipeline stall), so they require the unpack-to-Dest
-// path that copy_tile does not yet wire on Quasar (see tt-llk quasar_unpack_to_dest). Re-add them
-// once that path is enabled. fp32_dest_acc_en stays on whenever either endpoint is 32-bit.
+// (Float32->x, Int32->x) are listed too but GTEST_SKIP'd in the body: a narrow FPU datacopy cannot
+// land a 32-bit source into Dest (int datacopy -> all-zeros / pipeline stall), so they need the
+// unpack-to-Dest path that copy_tile does not yet wire on Quasar (see tt-llk quasar_unpack_to_dest).
+// Drop the skip once that path is enabled. fp32_dest_acc_en stays on whenever either endpoint is 32-bit.
 class SingleCoreSingleMeshDeviceSfpuTypecastFixture
     : public LLKMeshDeviceFixture,
       public testing::WithParamInterface<std::tuple<tt::DataFormat, tt::DataFormat>> {};
@@ -1643,6 +1643,13 @@ TEST_P(SingleCoreSingleMeshDeviceSfpuTypecastFixture, TensixSfpuTypecast) {
 
     if (MetalContext::instance().get_cluster().arch() != ARCH::QUASAR) {
         GTEST_SKIP() << "Typecast compute-API test is currently Quasar-only";
+    }
+
+    // 32-bit input needs unpack-to-Dest (a narrow FPU datacopy cannot land a 32-bit source into a
+    // 32-bit Dest: int datacopy -> all-zeros / pipeline stall). copy_tile does not yet wire the
+    // unpack-to-Dest path on Quasar, so these pairs are listed for visibility but skipped for now.
+    if (in_fmt == tt::DataFormat::Float32 || in_fmt == tt::DataFormat::Int32) {
+        GTEST_SKIP() << "32-bit input typecast needs unpack-to-Dest, not yet wired in copy_tile";
     }
 
     log_info(
@@ -1661,6 +1668,9 @@ INSTANTIATE_TEST_SUITE_P(
     ::testing::Values(
         std::make_tuple(tt::DataFormat::Float16_b, tt::DataFormat::Float32),
         std::make_tuple(tt::DataFormat::Float16_b, tt::DataFormat::Int32),
+        // 32-bit inputs: listed for visibility, GTEST_SKIP'd until unpack-to-Dest is wired.
+        std::make_tuple(tt::DataFormat::Float32, tt::DataFormat::Float16_b),
+        std::make_tuple(tt::DataFormat::Int32, tt::DataFormat::Float16_b),
         std::make_tuple(tt::DataFormat::MxFp8P, tt::DataFormat::Float16_b),
         std::make_tuple(tt::DataFormat::Float16_b, tt::DataFormat::MxFp8P),
         std::make_tuple(tt::DataFormat::MxFp8R, tt::DataFormat::Float16_b),
