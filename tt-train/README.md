@@ -38,7 +38,6 @@ tt-train is built using the `build_metal.sh` script, run from the tt-metal root 
 3. Set `BUILD_TT_TRAIN=ON` in your CMake configure settings
 4. Build all targets using the CMake extension
 
-
 # Run
 ## MNIST
 ### Training
