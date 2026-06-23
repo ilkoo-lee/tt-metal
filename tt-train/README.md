@@ -16,7 +16,7 @@ git submodule update --init --recursive
 
 # Building the project
 
-tt-train is built using the `build_metal.sh` script from the tt-metal root directory.
+tt-train is built using the `build_metal.sh` script, run from the tt-metal root directory.
 
 ## Terminal
 
