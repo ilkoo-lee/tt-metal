@@ -36,6 +36,21 @@ void kernel_main() {
     const uint32_t my_nt_d = get_arg_val<uint32_t>(2);
     // start (= expert_region_offsets) address. Only read when direct_write.
     const uint32_t start_addr = get_arg_val<uint32_t>(3);
+    // Leader-completion sync trailing args (see program factory). Consumed only
+    // at the very end of the kernel, after all output writes for this expert.
+    const uint32_t is_leader = get_arg_val<uint32_t>(4);
+    const uint32_t leader_noc_x = get_arg_val<uint32_t>(5);
+    const uint32_t leader_noc_y = get_arg_val<uint32_t>(6);
+    const uint32_t leader_sync_sem_id = get_arg_val<uint32_t>(7);
+    const uint32_t num_non_leader = get_arg_val<uint32_t>(8);
+    // Global-sem mcast args (only used on the leader path).
+    const uint32_t has_global_sem = get_arg_val<uint32_t>(9);
+    const uint32_t global_sem_mcast_start_x = get_arg_val<uint32_t>(10);
+    const uint32_t global_sem_mcast_start_y = get_arg_val<uint32_t>(11);
+    const uint32_t global_sem_mcast_end_x = get_arg_val<uint32_t>(12);
+    const uint32_t global_sem_mcast_end_y = get_arg_val<uint32_t>(13);
+    const uint32_t global_sem_num_dests = get_arg_val<uint32_t>(14);
+    const uint32_t global_sem_l1_addr = get_arg_val<uint32_t>(15);
 
     constexpr uint32_t cb_out = get_compile_time_arg_val(1);
     constexpr uint32_t per_core_M = get_compile_time_arg_val(2);
@@ -164,4 +179,46 @@ void kernel_main() {
     // Ensure all outstanding writes complete at the destination before the
     // kernel returns (the next dispatched op may read this output).
     noc_async_write_barrier();
+
+    // Leader-completion sync. Every core reaches here only after its own output
+    // writes have landed (the barrier above). Non-leader cores signal the leader
+    // core's leader_sync sem; the leader waits for all num_non_leader signals so
+    // it is provably the last core to finish, then multicast-increments the
+    // global semaphore (+1 for this expert).
+    const uint32_t leader_sem_l1 = get_semaphore(leader_sync_sem_id);
+    volatile tt_l1_ptr uint32_t* leader_sem_ptr = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(leader_sem_l1);
+    if (is_leader == 0) {
+        // Non-leader: increment the leader core's copy of the sync sem.
+        const uint64_t leader_noc_addr = get_noc_addr(leader_noc_x, leader_noc_y, leader_sem_l1);
+        noc_semaphore_inc(leader_noc_addr, 1);
+        noc_async_atomic_barrier();
+    } else {
+        // Leader: block until every non-leader has signaled completion.
+        if (num_non_leader > 0) {
+            noc_semaphore_wait(leader_sem_ptr, num_non_leader);
+        }
+        // Then bump every instance of the global semaphore.
+        if (has_global_sem) {
+            // This writer kernel runs on the DRAM-write NOC (NOC1 on Blackhole),
+            // whose coordinate system is inverted vs NOC0: get_noc_multicast_addr
+            // maps each coord x -> (size-1-x). NOC_MULTICAST_ADDR requires the
+            // rectangle's start <= end in the *target NOC's* hardware coords, but
+            // the host computed start/end as min/max in NOC0/virtual coords. On
+            // NOC1 the inversion flips that ordering, so we must pass the corners
+            // as (max -> min); on NOC0 we pass them as-is (min -> max).
+            uint32_t mc_sx = global_sem_mcast_start_x;
+            uint32_t mc_sy = global_sem_mcast_start_y;
+            uint32_t mc_ex = global_sem_mcast_end_x;
+            uint32_t mc_ey = global_sem_mcast_end_y;
+            if (noc_index == 1) {
+                mc_sx = global_sem_mcast_end_x;
+                mc_sy = global_sem_mcast_end_y;
+                mc_ex = global_sem_mcast_start_x;
+                mc_ey = global_sem_mcast_start_y;
+            }
+            const uint64_t gsem_mcast_noc_addr = get_noc_multicast_addr(mc_sx, mc_sy, mc_ex, mc_ey, global_sem_l1_addr);
+            noc_semaphore_inc_multicast(gsem_mcast_noc_addr, 1, global_sem_num_dests);
+            noc_async_atomic_barrier();
+        }
+    }
 }
