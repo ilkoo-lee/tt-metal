@@ -56,7 +56,7 @@ void run_kernel(RUNTIME_PARAMETERS params)
     const std::uint32_t unpack_src_data_types[NUM_STAGES] = {formats.unpack_A_src, TOPK_INDEX_FORMAT};
     const std::uint32_t unpack_dst_data_types[NUM_STAGES] = {formats.unpack_A_dst, TOPK_INDEX_FORMAT};
 
-    // Dvalid setup: UNPACK -> FPU -> SFPU -> PACK
+    // Dvalid setup: FPU -> SFPU -> PACK
     set_up_dest_dvalid_per_thread<dest_dvalid_client::UNPACK>({dest_dvalid_client::FPU, dest_dvalid_client::SFPU, dest_dvalid_client::PACK});
 
     const std::uint32_t buf_desc_id = 0;
@@ -149,8 +149,6 @@ void run_kernel(RUNTIME_PARAMETERS params)
 // ============================================================================
 
 #ifdef LLK_TRISC_MATH
-
-const bool is_int_fpu_en = false;
 
 #include "cfg_defines.h"
 #include "ckernel_sfpu.h"
