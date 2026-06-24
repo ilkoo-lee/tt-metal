@@ -54,7 +54,7 @@ static inline void thread_init_impl(SanitizerState& sanitizer)
     }
 
     new (&sanitizer.operation[COMPILE_FOR_TRISC]) llk::san::OperationState();
-    new (&sanitizer.fsm[COMPILE_FOR_TRISC]) llk::san::FsmState(llk::san::FsmState::Initial);
+    new (&sanitizer.fsm[COMPILE_FOR_TRISC]) llk::san::FsmState();
 }
 
 static inline void thread_silent_push_impl(ThreadOutputContext& context)
@@ -351,12 +351,11 @@ constexpr size_t _operation_entry_size(
 
 // Goes in LLK_LIB in Init
 // Store operation type and push arguments to state stack
-template <Operation op, typename... Ts>
+template <Operation operation, typename... Ts>
 static inline void operation_init_impl(ThreadOutputContext& context, OperationState& state, const Ts... args)
 {
-    state.operation     = op;
-    state.expect_uninit = operation_must_uninit<op>;
-    context.operation   = context.current;
+    state.operation   = operation;
+    context.operation = context.current;
 
     constexpr std::uint8_t args_count = _args_count<Ts...>();
 
@@ -393,18 +392,11 @@ static inline void operation_init_impl(ThreadOutputContext& context, OperationSt
 }
 
 // Goes in LLK_LIB in Execute
-// Check operation type and arguments against stored ones
-template <Operation op, typename... Ts>
+// Check operation arguments against stored ones
+template <Operation operation, typename... Ts>
 static inline void operation_check_impl(const ThreadOutputContext& context, OperationState& state, const Ts... args)
 {
-    if (thread_silent_get_impl(context))
-    {
-        return;
-    }
-
-    const bool passed = operation_assert<Trigger::ERROR>(state.operation, op, context.operation, context.current);
-
-    if (!passed)
+    if (thread_silent_get_impl(context) || state.operation != operation)
     {
         return;
     }
@@ -451,103 +443,222 @@ static inline void operation_check_impl(const ThreadOutputContext& context, Oper
     }
 }
 
-// Goes in LLK_LIB in Uninit
-// Check operation type and clear must uninit flag
-template <Operation op>
-static inline void operation_uninit_impl(const ThreadOutputContext& context, OperationState& state)
+static inline void fsm_check(ThreadOutputContext& context, const FsmState& current, const FsmStateType type, const Operation operation)
 {
-    if (!thread_silent_get_impl(context))
+    if (thread_silent_get_impl(context))
     {
-        operation_assert<Trigger::ERROR>(state.operation, op, context.operation, context.current);
+        return;
     }
 
-    state.expect_uninit = false;
+    const FsmState next = {type, operation};
+
+    // Checks for transitions from INITIAL
+
+    // INITIAL -> CONFIGURED: Valid
+    // ELSE: Error (The first operation in the kernel must be a hardware configure)
+    fsm_assert<Trigger::ERROR>(
+        current.type != FsmStateType::Initial || next.type == FsmStateType::Configured,
+        CTSTR("First transition must be INITIAL -> CONFIGURED"),
+        current,
+        next,
+        CTSTR("CONFIGURED"),
+        context.fsm,
+        context.current);
+
+    // Checks for transitions from CONFIGURED
+
+    // CONFIGURED -> INITIALIZED: Valid
+    // CONFIGURED -> RECONFIGURED: Warn (Functionally valid, Performance loss)
+    // ELSE: Error
+    fsm_assert<Trigger::ERROR>(
+        current.type != FsmStateType::Configured || next.type == FsmStateType::Initialized || next.type == FsmStateType::Reconfigured,
+        CTSTR("Expected CONFIGURED -> [INITIALIZED]"),
+        current,
+        next,
+        CTSTR("INITIALIZED"),
+        context.fsm,
+        context.current);
+
+    fsm_assert<Trigger::WARN>(
+        current.type != FsmStateType::Configured || next.type != FsmStateType::Reconfigured,
+        CTSTR("RECONFIGURE after CONFIGURE is a performance loss, expected CONFIGURED -> INITIALIZED"),
+        current,
+        next,
+        CTSTR("INITIALIZED"),
+        context.fsm,
+        context.current);
+
+    // Checks for transitions from INITIALIZED
+    // INITIALIZED[X] -> EXECUTED[X]: Valid
+    // INITIALIZED[X] -> INITIALIZED[Y]: WARN (Functionally valid, Performance loss)
+    // INITIALIZED[X] -> UNINITIALIZED[X]: WARN (Functionally valid, Performance loss)
+    //
+    // sstanisic fixme: remove reconfig between init and execute
+    // IF EXPECT_UNINIT == FALSE
+    //     INITIALIZED[X] -> RECONFIGURED: Valid
+    //
+    // ELSE: Error
+    fsm_assert<Trigger::ERROR>(
+        !(current.type == FsmStateType::Initialized && current.expect_uninit) || next.type == FsmStateType::Executed ||
+            next.type == FsmStateType::Initialized || next.type == FsmStateType::Uninitialized,
+        CTSTR("Operation with required UNINIT, expected INITIALIZED[X] -> EXECUTED[X]"),
+        current,
+        next,
+        CTSTR("EXECUTED[X]"),
+        context.fsm,
+        context.current);
+
+    fsm_assert<Trigger::WARN>(
+        current.type != FsmStateType::Initialized || next.type != FsmStateType::Initialized,
+        CTSTR("INITIALIZE[Y] after INITIALIZE[X] is a performance loss, expected INITIALIZED[X] -> EXECUTED[X]"),
+        current,
+        next,
+        CTSTR("EXECUTED[X]"),
+        context.fsm,
+        context.current);
+
+    fsm_assert<Trigger::WARN>(
+        current.type != FsmStateType::Initialized || next.type != FsmStateType::Uninitialized,
+        CTSTR("UNINITIALIZE[X] after INITIALIZE[X] is a performance loss, expected INITIALIZED[X] -> EXECUTED[X]"),
+        current,
+        next,
+        CTSTR("EXECUTED[X]"),
+        context.fsm,
+        context.current);
+
+    fsm_assert<Trigger::ERROR>(
+        !(current.type == FsmStateType::Initialized && !current.expect_uninit) || next.type == FsmStateType::Executed ||
+            next.type == FsmStateType::Initialized || next.type == FsmStateType::Uninitialized || next.type == FsmStateType::Reconfigured,
+        CTSTR("Operation with no required UNINIT, expected INITIALIZED[X] -> EXECUTED[X]"),
+        current,
+        next,
+        CTSTR("EXECUTED[X]"),
+        context.fsm,
+        context.current);
+
+    fsm_assert<Trigger::WARN>(
+        !(current.type == FsmStateType::Initialized && !current.expect_uninit) || next.type != FsmStateType::Reconfigured,
+        CTSTR("Operation with no required UNINIT, RECONFIGURE after INITIALIZE[X] is DEPRECATED, expected INITIALIZED[X] -> EXECUTED[X]"),
+        current,
+        next,
+        CTSTR("EXECUTED[X]"),
+        context.fsm,
+        context.current);
+
+    // Checks for transitions from EXECUTED
+
+    // Operations that require uninit must uninit (or execute again) before doing anything else:
+    //   EXECUTED -> [UNINITIALIZED, EXECUTED]: Valid
+    //   ELSE: Error
+    fsm_assert<Trigger::ERROR>(
+        current.type != FsmStateType::Executed || !current.expect_uninit || next.type == FsmStateType::Uninitialized || next.type == FsmStateType::Executed,
+        CTSTR("Operation UNINIT required, expected EXECUTED -> [UNINITIALIZED, EXECUTED]"),
+        current,
+        next,
+        CTSTR("UNINITIALIZED, EXECUTED"),
+        context.fsm,
+        context.current);
+
+    // Operations that don't require uninit may re-init, reconfigure, or execute again:
+    //   EXECUTED -> [EXECUTED, INITIALIZED, RECONFIGURED]: Valid
+    //   ELSE: Error
+    fsm_assert<Trigger::ERROR>(
+        current.type != FsmStateType::Executed || current.expect_uninit || next.type == FsmStateType::Executed || next.type == FsmStateType::Initialized ||
+            next.type == FsmStateType::Reconfigured,
+        CTSTR("Operation UNINIT not required, expected EXECUTED -> [EXECUTED, INITIALIZED, RECONFIGURED]"),
+        current,
+        next,
+        CTSTR("EXECUTED, INITIALIZED, RECONFIGURED"),
+        context.fsm,
+        context.current);
+
+    // Checks for transitions from UNINITIALIZED
+
+    // UNINITIALIZED -> [INITIALIZED, RECONFIGURED]: Valid
+    // ELSE: Error
+    fsm_assert<Trigger::ERROR>(
+        current.type != FsmStateType::Uninitialized || next.type == FsmStateType::Initialized || next.type == FsmStateType::Reconfigured,
+        CTSTR("Expected UNINITIALIZED -> [INITIALIZED, RECONFIGURED]"),
+        current,
+        next,
+        CTSTR("INITIALIZED, RECONFIGURED"),
+        context.fsm,
+        context.current);
+
+    // Checks for transitions from RECONFIGURED
+
+    // RECONFIGURED -> [INITIALIZED, RECONFIGURED]: Valid
+    // ELSE: Error
+    fsm_assert<Trigger::ERROR>(
+        current.type != FsmStateType::Reconfigured || next.type == FsmStateType::Initialized || next.type == FsmStateType::Reconfigured,
+        CTSTR("Expected RECONFIGURED -> [INITIALIZED, RECONFIGURED]"),
+        current,
+        next,
+        CTSTR("INITIALIZED, RECONFIGURED"),
+        context.fsm,
+        context.current);
+
+    // OPTYPE: EXECUTE / UNINIT must match the OpType established by INIT. Gated on a valid order so
+    // that current.operation is meaningful (not stale from a previous lifecycle).
+    const bool execute_on_valid = next.type == FsmStateType::Executed && (current.type == FsmStateType::Initialized || current.type == FsmStateType::Executed);
+    const bool uninit_on_valid  = next.type == FsmStateType::Uninitialized && current.type == FsmStateType::Executed;
+
+    if (execute_on_valid || uninit_on_valid)
+    {
+        operation_assert<Trigger::ERROR>(current.operation, next.operation, context.operation, context.current);
+    }
 }
 
-template <FsmState next>
-static inline void fsm_advance_impl(ThreadOutputContext& context, FsmState& current, [[maybe_unused]] const OperationState& operation)
+// Goes in LLK_LIB in HWConfigure (first configure of the kernel)
+static inline void fsm_configure(ThreadOutputContext& context, FsmState& current)
 {
-    if (!thread_silent_get_impl(context))
-    {
-        fsm_assert<Trigger::ERROR>(
-            current != FsmState::Initial || next == FsmState::Configured,
-            CTSTR("First transition must be INITIAL -> CONFIGURED"),
-            current,
-            next,
-            CTSTR("CONFIGURED"),
-            UnwindContext::UNKNOWN,
-            context.current);
+    fsm_check(context, current, FsmStateType::Configured, Operation::None);
 
-        fsm_assert<Trigger::ERROR>(
-            current != FsmState::Configured || next == FsmState::Initialized,
-            CTSTR("Expected CONFIGURED -> INITIALIZED"),
-            current,
-            next,
-            CTSTR("INITIALIZED"),
-            context.fsm,
-            context.current);
+    current.type = FsmStateType::Configured;
+    context.fsm  = context.current;
+}
 
-        fsm_assert<Trigger::ERROR>(
-            current != FsmState::Initialized || !operation.expect_uninit || next == FsmState::Executed,
-            CTSTR("Operation UNINIT required, expected INITIALIZED -> EXECUTED"),
-            current,
-            next,
-            CTSTR("EXECUTED"),
-            context.fsm,
-            context.current);
+// Goes in LLK_LIB in HWReconfig
+static inline void fsm_reconfigure(ThreadOutputContext& context, FsmState& current)
+{
+    fsm_check(context, current, FsmStateType::Reconfigured, Operation::None);
 
-        // Reconfig after init (without an intervening execute) is tolerated for operations that don't require
-        // uninit, but it is still likely indicative of a bug, hence WARN rather than ERROR.
-        fsm_assert<Trigger::WARN>(
-            current != FsmState::Initialized || operation.expect_uninit || next == FsmState::Executed || next == FsmState::Reconfigured,
-            CTSTR("Operation UNINIT not required, expected INITIALIZED -> [EXECUTED, RECONFIGURED]"),
-            current,
-            next,
-            CTSTR("EXECUTED, RECONFIGURED"),
-            context.fsm,
-            context.current);
+    current.type = FsmStateType::Reconfigured;
+    context.fsm  = context.current;
+}
 
-        fsm_assert<Trigger::ERROR>(
-            current != FsmState::Executed || !operation.expect_uninit || next == FsmState::Uninitialized || next == FsmState::Executed,
-            CTSTR("Operation UNINIT required, expected EXECUTED -> [UNINITIALIZED, EXECUTED]"),
-            current,
-            next,
-            CTSTR("UNINITIALIZED, EXECUTED"),
-            context.fsm,
-            context.current);
+// Goes in LLK_LIB in Init
+template <Operation operation>
+static inline void fsm_init(ThreadOutputContext& context, FsmState& current)
+{
+    fsm_check(context, current, FsmStateType::Initialized, operation);
 
-        fsm_assert<Trigger::ERROR>(
-            current != FsmState::Executed || operation.expect_uninit || next == FsmState::Executed || next == FsmState::Initialized ||
-                next == FsmState::Reconfigured,
-            CTSTR("Operation UNINIT not required, expected EXECUTED -> [EXECUTED, INITIALIZED, RECONFIGURED]"),
-            current,
-            next,
-            CTSTR("EXECUTED, INITIALIZED, RECONFIGURED"),
-            context.fsm,
-            context.current);
+    current.type          = FsmStateType::Initialized;
+    current.operation     = operation;
+    current.expect_uninit = operation_must_uninit<operation>;
+    context.fsm           = context.current;
+}
 
-        fsm_assert<Trigger::ERROR>(
-            current != FsmState::Uninitialized || next == FsmState::Initialized || next == FsmState::Reconfigured,
-            CTSTR("Expected UNINITIALIZED -> [INITIALIZED, RECONFIGURED]"),
-            current,
-            next,
-            CTSTR("INITIALIZED, RECONFIGURED"),
-            context.fsm,
-            context.current);
+// Goes in LLK_LIB in Execute
+template <Operation operation>
+static inline void fsm_execute(ThreadOutputContext& context, FsmState& current)
+{
+    fsm_check(context, current, FsmStateType::Executed, operation);
 
-        fsm_assert<Trigger::ERROR>(
-            current != FsmState::Reconfigured || next == FsmState::Initialized || next == FsmState::Reconfigured,
-            CTSTR("Expected RECONFIGURED -> [INITIALIZED, RECONFIGURED]"),
-            current,
-            next,
-            CTSTR("INITIALIZED, RECONFIGURED"),
-            context.fsm,
-            context.current);
-    }
+    current.type = FsmStateType::Executed;
+    context.fsm  = context.current;
+}
 
-    // valid transition -> commit
-    current     = next;
-    context.fsm = context.current;
+// Goes in LLK_LIB in Uninit
+template <Operation operation>
+static inline void fsm_uninit(ThreadOutputContext& context, FsmState& current)
+{
+    fsm_check(context, current, FsmStateType::Uninitialized, operation);
+
+    current.type          = FsmStateType::Uninitialized;
+    current.operation     = Operation::None;
+    current.expect_uninit = false;
+    context.fsm           = context.current;
 }
 
 } // namespace llk::san

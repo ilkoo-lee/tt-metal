@@ -281,6 +281,7 @@ struct OperandState
 
 enum class Operation : std::uint8_t
 {
+    None,
     UnpackA,
     UnpackABMatmul,
     UnpackUntilize,
@@ -322,13 +323,9 @@ struct OperationState
     alignas(alignof(max_align_t)) char buffer[BUFFER_SIZE];
 
     Operation operation;
-
-    // enabled by operation_init if the operation must be uninitializer
-    // disabled by operation_uninit
-    bool expect_uninit;
 };
 
-enum class FsmState : std::uint32_t
+enum class FsmStateType : std::uint32_t
 {
     Initial,
     Configured,
@@ -336,6 +333,13 @@ enum class FsmState : std::uint32_t
     Executed,
     Uninitialized,
     Reconfigured
+};
+
+struct FsmState
+{
+    FsmStateType type   = FsmStateType::Initial;
+    Operation operation = Operation::None; // INIT, EXECUTE, UNINIT
+    bool expect_uninit  = false;           // INIT, UNINIT
 };
 
 struct UnwindContext

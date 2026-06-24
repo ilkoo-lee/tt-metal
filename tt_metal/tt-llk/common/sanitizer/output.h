@@ -215,27 +215,27 @@ NOINLINE NOCLONE void operation_argument_assert(
     LLK_ASSERT(false, "Operation argument assertion, look at Sanitizer log");
 }
 
-static inline ct_string fsm_state_name(const FsmState state)
+static inline ct_string fsm_state_name(const FsmStateType state)
 {
     switch (state)
     {
-        case FsmState::Initial:
+        case FsmStateType::Initial:
             return CTSTR("INITIAL");
-        case FsmState::Configured:
+        case FsmStateType::Configured:
             return CTSTR("CONFIGURED");
-        case FsmState::Initialized:
+        case FsmStateType::Initialized:
             return CTSTR("INITIALIZED");
-        case FsmState::Executed:
+        case FsmStateType::Executed:
             return CTSTR("EXECUTED");
-        case FsmState::Uninitialized:
+        case FsmStateType::Uninitialized:
             return CTSTR("UNINITIALIZED");
-        case FsmState::Reconfigured:
+        case FsmStateType::Reconfigured:
             return CTSTR("RECONFIGURED");
     }
     __builtin_unreachable();
 }
 
-NOINLINE NOCLONE void _print_fsm_transition(const FsmState current_state, const FsmState next_state, const ct_string allowed)
+NOINLINE NOCLONE void _print_fsm_transition(const FsmStateType current_state, const FsmStateType next_state, const ct_string allowed)
 {
     DEVICE_PRINT(
         "│\r"
@@ -270,7 +270,7 @@ NOINLINE NOCLONE void fsm_assert(
         message);
 
     _print_full_kernel();
-    _print_fsm_transition(transition_from, transition_to, transition_allowed);
+    _print_fsm_transition(transition_from.type, transition_to.type, transition_allowed);
 
     DEVICE_PRINT(
         "│\r"
