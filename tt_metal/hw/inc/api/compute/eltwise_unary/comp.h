@@ -375,7 +375,7 @@ ALWI void gtz_tile_init() {
 #ifndef ARCH_QUASAR
     MATH(SFPU_UNARY_INIT(greater_than_zero));
 #else
-    MATH((llk_math_eltwise_unary_sfpu_init<SfpuType::greater_than_zero>(sfpu::_init_zero_comp_)));
+    MATH(SFPU_UNARY_INIT(greater_than_zero, sfpu::_init_zero_comp_));
 #endif
 }
 
@@ -415,7 +415,7 @@ ALWI void nez_tile_init() {
 #ifndef ARCH_QUASAR
     MATH(SFPU_UNARY_INIT(not_equal_zero));
 #else
-    MATH((llk_math_eltwise_unary_sfpu_init<SfpuType::not_equal_zero>(sfpu::_init_zero_comp_)));
+    MATH(SFPU_UNARY_INIT(not_equal_zero, sfpu::_init_zero_comp_));
 #endif
 }
 
@@ -460,7 +460,7 @@ ALWI void gez_tile_init() {
 #ifndef ARCH_QUASAR
     MATH(SFPU_UNARY_INIT(greater_than_equal_zero));
 #else
-    MATH((llk_math_eltwise_unary_sfpu_init<SfpuType::greater_than_equal_zero>(sfpu::_init_zero_comp_)));
+    MATH(SFPU_UNARY_INIT(greater_than_equal_zero, sfpu::_init_zero_comp_));
 #endif
 }
 
@@ -500,7 +500,7 @@ ALWI void ltz_tile_init() {
 #ifndef ARCH_QUASAR
     MATH(SFPU_UNARY_INIT(less_than_zero));
 #else
-    MATH((llk_math_eltwise_unary_sfpu_init<SfpuType::less_than_zero>(sfpu::_init_zero_comp_)));
+    MATH(SFPU_UNARY_INIT(less_than_zero, sfpu::_init_zero_comp_));
 #endif
 }
 
@@ -540,7 +540,7 @@ ALWI void eqz_tile_init() {
 #ifndef ARCH_QUASAR
     MATH(SFPU_UNARY_INIT(equal_zero));
 #else
-    MATH((llk_math_eltwise_unary_sfpu_init<SfpuType::equal_zero>(sfpu::_init_zero_comp_)));
+    MATH(SFPU_UNARY_INIT(equal_zero, sfpu::_init_zero_comp_));
 #endif
 }
 
@@ -580,7 +580,7 @@ ALWI void lez_tile_init() {
 #ifndef ARCH_QUASAR
     MATH(SFPU_UNARY_INIT(less_than_equal_zero));
 #else
-    MATH((llk_math_eltwise_unary_sfpu_init<SfpuType::less_than_equal_zero>(sfpu::_init_zero_comp_)));
+    MATH(SFPU_UNARY_INIT(less_than_equal_zero, sfpu::_init_zero_comp_));
 #endif
 }
 
