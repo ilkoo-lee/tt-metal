@@ -124,26 +124,46 @@ inline void _calculate_sfpu_isinf_isnan_()
     for (int d = 0; d < ITERATIONS; d++)
     {
         sfpi::vFloat val = sfpi::dst_reg[0];
-
+        sfpi::vFloat res = 0.0f;
         if constexpr (operation == SfpuType::isinf)
         {
-            val = _calculate_isinf_<APPROXIMATION_MODE>(val);
+            v_if (sfpi::is_inf(val))
+            {
+                res = 1.0f;
+            }
+            v_endif;
         }
         else if constexpr (operation == SfpuType::isposinf)
         {
-            val = _calculate_isposinf_<APPROXIMATION_MODE>(val);
+            v_if (sfpi::is_pos(val) && sfpi::is_inf(val))
+            {
+                res = 1.0f;
+            }
+            v_endif;
         }
         else if constexpr (operation == SfpuType::isneginf)
         {
-            val = _calculate_isneginf_<APPROXIMATION_MODE>(val);
+            v_if (sfpi::is_neg(val) && sfpi::is_inf(val))
+            {
+                res = 1.0f;
+            }
+            v_endif;
         }
         else if constexpr (operation == SfpuType::isnan)
         {
-            val = _calculate_isnan_<APPROXIMATION_MODE>(val);
+            v_if (sfpi::is_nan(val))
+            {
+                res = 1.0f;
+            }
+            v_endif;
         }
         else if constexpr (operation == SfpuType::isfinite)
         {
-            val = _calculate_isfinite_<APPROXIMATION_MODE>(val);
+            v_if (sfpi::is_normal(val))
+            {
+                res = 1.0f;
+            }
+            v_endif;
         }
 
         sfpi::dst_reg[0] = val;
