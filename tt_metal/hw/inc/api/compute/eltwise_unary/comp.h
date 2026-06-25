@@ -361,7 +361,7 @@ ALWI void gtz_tile(uint32_t idst) {
     MATH(SFPU_UNARY_CALL(
         DST_SYNC_MODE,
         DST_ACCUM_MODE,
-        _calculate_zero_comp_,
+        calculate_zero_comp,
         (APPROX, DataFormat::Float32, SfpuType::greater_than_zero, SFPU_ITERATIONS),
         idst,
         VectorMode::RC));
@@ -375,7 +375,7 @@ ALWI void gtz_tile_init() {
 #ifndef ARCH_QUASAR
     MATH(SFPU_UNARY_INIT(greater_than_zero));
 #else
-    MATH(SFPU_UNARY_INIT(greater_than_zero, sfpu::_init_zero_comp_));
+    MATH(SFPU_UNARY_INIT(greater_than_zero, sfpu::init_zero_comp));
 #endif
 }
 
@@ -401,7 +401,7 @@ ALWI void nez_tile(uint32_t idst) {
     MATH(SFPU_UNARY_CALL(
         DST_SYNC_MODE,
         DST_ACCUM_MODE,
-        _calculate_zero_comp_,
+        calculate_zero_comp,
         (APPROX, DataFormat::Float32, SfpuType::not_equal_zero, SFPU_ITERATIONS),
         idst,
         VectorMode::RC));
@@ -415,7 +415,7 @@ ALWI void nez_tile_init() {
 #ifndef ARCH_QUASAR
     MATH(SFPU_UNARY_INIT(not_equal_zero));
 #else
-    MATH(SFPU_UNARY_INIT(not_equal_zero, sfpu::_init_zero_comp_));
+    MATH(SFPU_UNARY_INIT(not_equal_zero, sfpu::init_zero_comp));
 #endif
 }
 
@@ -446,7 +446,7 @@ ALWI void gez_tile(uint32_t idst) {
     MATH(SFPU_UNARY_CALL(
         DST_SYNC_MODE,
         DST_ACCUM_MODE,
-        _calculate_zero_comp_,
+        calculate_zero_comp,
         (APPROX, DataFormat::Float32, SfpuType::greater_than_equal_zero, SFPU_ITERATIONS),
         idst,
         VectorMode::RC));
@@ -460,7 +460,7 @@ ALWI void gez_tile_init() {
 #ifndef ARCH_QUASAR
     MATH(SFPU_UNARY_INIT(greater_than_equal_zero));
 #else
-    MATH(SFPU_UNARY_INIT(greater_than_equal_zero, sfpu::_init_zero_comp_));
+    MATH(SFPU_UNARY_INIT(greater_than_equal_zero, sfpu::init_zero_comp));
 #endif
 }
 
@@ -486,7 +486,7 @@ ALWI void ltz_tile(uint32_t idst) {
     MATH(SFPU_UNARY_CALL(
         DST_SYNC_MODE,
         DST_ACCUM_MODE,
-        _calculate_zero_comp_,
+        calculate_zero_comp,
         (APPROX, DataFormat::Float32, SfpuType::less_than_zero, SFPU_ITERATIONS),
         idst,
         VectorMode::RC));
@@ -500,7 +500,7 @@ ALWI void ltz_tile_init() {
 #ifndef ARCH_QUASAR
     MATH(SFPU_UNARY_INIT(less_than_zero));
 #else
-    MATH(SFPU_UNARY_INIT(less_than_zero, sfpu::_init_zero_comp_));
+    MATH(SFPU_UNARY_INIT(less_than_zero, sfpu::init_zero_comp));
 #endif
 }
 
@@ -526,7 +526,7 @@ ALWI void eqz_tile(uint32_t idst) {
     MATH(SFPU_UNARY_CALL(
         DST_SYNC_MODE,
         DST_ACCUM_MODE,
-        _calculate_zero_comp_,
+        calculate_zero_comp,
         (APPROX, DataFormat::Float32, SfpuType::equal_zero, SFPU_ITERATIONS),
         idst,
         VectorMode::RC));
@@ -540,7 +540,7 @@ ALWI void eqz_tile_init() {
 #ifndef ARCH_QUASAR
     MATH(SFPU_UNARY_INIT(equal_zero));
 #else
-    MATH(SFPU_UNARY_INIT(equal_zero, sfpu::_init_zero_comp_));
+    MATH(SFPU_UNARY_INIT(equal_zero, sfpu::init_zero_comp));
 #endif
 }
 
@@ -566,7 +566,7 @@ ALWI void lez_tile(uint32_t idst) {
     MATH(SFPU_UNARY_CALL(
         DST_SYNC_MODE,
         DST_ACCUM_MODE,
-        _calculate_zero_comp_,
+        calculate_zero_comp,
         (APPROX, DataFormat::Float32, SfpuType::less_than_equal_zero, SFPU_ITERATIONS),
         idst,
         VectorMode::RC));
@@ -580,7 +580,7 @@ ALWI void lez_tile_init() {
 #ifndef ARCH_QUASAR
     MATH(SFPU_UNARY_INIT(less_than_equal_zero));
 #else
-    MATH(SFPU_UNARY_INIT(less_than_equal_zero, sfpu::_init_zero_comp_));
+    MATH(SFPU_UNARY_INIT(less_than_equal_zero, sfpu::init_zero_comp));
 #endif
 }
 
