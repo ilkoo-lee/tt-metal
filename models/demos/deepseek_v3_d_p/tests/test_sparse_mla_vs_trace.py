@@ -94,8 +94,9 @@ from models.demos.deepseek_v3_d_p.utils.test_utils import WH_WORKER_L1_SIZE
 _DSV32 = TEST_VARIANTS["deepseek_v32"]  # build_cpu_reference is variant-driven; the DS path uses the V3.2 variant
 
 # Bespoke suite: validated against recorded vLLM trace bundles (indexer logits/topk, sparse output,
-# k_pe frame), so it stays here rather than on the v3.1 TestVariant infra. Group = accuracy.
-pytestmark = [pytest.mark.trace, pytest.mark.gate, pytest.mark.accuracy]
+# k_pe frame), so it stays here rather than on the v3.1 TestVariant infra. `trace` marks it as a
+# trace-bundle parity test (run separately from the CI correctness matrix).
+pytestmark = pytest.mark.trace
 
 
 @pytest.fixture(autouse=True, scope="module")

@@ -10,8 +10,9 @@ by its dotted name and never auto-loaded as a conftest, pytest registers it exac
 both sibling suites are collected together — so the options/markers are registered a single time
 (listing it in two conftests would otherwise double-register and error).
 
-It carries everything the two suites must share: the tier markers (dev ⊆ gate ⊆ nightly) and the
-``--ds-*`` MLA/indexer knobs with their ``ds_*`` fixtures.
+It carries what the suites must share: the ``perf`` / ``trace`` markers (for the out-of-band suites
+that run separately from the fast correctness matrix) and the ``--ds-*`` MLA/indexer knobs with their
+``ds_*`` fixtures.
 """
 
 import re
@@ -28,20 +29,15 @@ def is_marker_explicitly_selected(config, marker: str) -> bool:
 
 
 def pytest_configure(config):
-    """Register the shared tier markers (dev ⊆ gate ⊆ nightly) and the test-group markers."""
+    """Register the markers for tests that run SEPARATELY from the default correctness matrix.
+
+    The sparse-MLA correctness suite (test_sparse_mla.py) is small/fast enough (~2 min) to run
+    wholesale, so it carries no tier/intent markers. Only the out-of-band suites are marked, so CI can
+    exclude them with e.g. -m "not perf and not trace".
+    """
     for line in (
-        # tier
-        "dev: fast inner-loop tests (~1 min, no cold CPU truth) — run per-edit",
-        "gate: full correctness matrix (CPU truths must be cached; ~10-15 min) — pre-commit/CI",
-        "nightly: cold-truth builds + scale gate (big-box only; excluded by default)",
-        # group (intent) — orthogonal to tier; select with e.g. -m "accuracy and gate"
-        "accuracy: output / KV PCC vs the reference",
-        "determinism: same input -> same output across repeated runs",
-        "feature_chunking: chunked prefill == single-shot",
-        "feature_cache: KV / index cache correctness",
-        "mesh: SP x TP distribution coverage",
-        "perf: per-op device-kernel timing",
-        "trace: official trace-bundle parity tests",
+        "perf: per-op device-kernel timing (run under tracy, separate from correctness)",
+        "trace: official trace-bundle parity tests (run separately from the correctness matrix)",
     ):
         config.addinivalue_line("markers", line)
 
