@@ -104,18 +104,9 @@ const map<std::string, std::map<std::string, std::string>> sfpu_binary_op_to_op_
     {"mul_int",
      {{"SFPU_OP_INIT_0", "mul_int_tile_init<DataFormat::Int32>();"},
       {"SFPU_OP_CHAIN_0", "mul_int_tile<DataFormat::Int32>(0, 1, 0);"}}},
-    {"lt_int",
-     {{"SFPU_OP_INIT_0", "lt_int_tile_init<DataFormat::Int32>();"},
-      {"SFPU_OP_CHAIN_0", "lt_int_tile<DataFormat::Int32>(0, 1, 0);"}}},
     {"gt_int",
      {{"SFPU_OP_INIT_0", "gt_int_tile_init<DataFormat::Int32>();"},
       {"SFPU_OP_CHAIN_0", "gt_int_tile<DataFormat::Int32>(0, 1, 0);"}}},
-    {"le_int",
-     {{"SFPU_OP_INIT_0", "le_int_tile_init<DataFormat::Int32>();"},
-      {"SFPU_OP_CHAIN_0", "le_int_tile<DataFormat::Int32>(0, 1, 0);"}}},
-    {"ge_int",
-     {{"SFPU_OP_INIT_0", "ge_int_tile_init<DataFormat::Int32>();"},
-      {"SFPU_OP_CHAIN_0", "ge_int_tile<DataFormat::Int32>(0, 1, 0);"}}},
     {"binary_max", {{"SFPU_OP_INIT_0", "binary_max_tile_init();"}, {"SFPU_OP_CHAIN_0", "binary_max_tile(0, 1, 0);"}}},
     {"binary_min", {{"SFPU_OP_INIT_0", "binary_min_tile_init();"}, {"SFPU_OP_CHAIN_0", "binary_min_tile(0, 1, 0);"}}},
     {"binary_max_int32",
@@ -125,9 +116,8 @@ const map<std::string, std::map<std::string, std::string>> sfpu_binary_op_to_op_
 };
 
 bool is_int8_binary_sfpu_op(const std::string& op_name) {
-    return (op_name == "add_int") || (op_name == "mul_int") || (op_name == "lt_int") || (op_name == "gt_int") ||
-           (op_name == "le_int") || (op_name == "ge_int") || (op_name == "binary_max_int32") ||
-           (op_name == "binary_min_int32");
+    return (op_name == "add_int") or (op_name == "mul_int") or (op_name == "gt_int") or
+           (op_name == "binary_max_int32") or (op_name == "binary_min_int32");
 }
 
 // Scalar golden for the unary SFPU ops, computed in float. Both the bf16 and
@@ -243,17 +233,8 @@ int32_t get_binary_int_operation_result(const std::string& op_name, int lhs, int
     if (op_name == "mul_int") {
         return static_cast<int32_t>(lhs * rhs);
     }
-    if (op_name == "lt_int") {
-        return (lhs < rhs) ? 1 : 0;
-    }
     if (op_name == "gt_int") {
         return (lhs > rhs) ? 1 : 0;
-    }
-    if (op_name == "le_int") {
-        return (lhs <= rhs) ? 1 : 0;
-    }
-    if (op_name == "ge_int") {
-        return (lhs >= rhs) ? 1 : 0;
     }
     if (op_name == "binary_max_int32") {
         return std::max(lhs, rhs);
@@ -801,10 +782,7 @@ bool run_sfpu_binary_two_input_buffer(
             sfpu_defines["SFPU_OP_BINARY_ADD_INT_INCLUDE"] = "1";
         } else if (test_config.sfpu_op == "mul_int") {
             sfpu_defines["SFPU_OP_BINARY_MUL_INT_INCLUDE"] = "1";
-        } else if (
-            test_config.sfpu_op == "lt_int" || test_config.sfpu_op == "gt_int" || test_config.sfpu_op == "le_int" ||
-            test_config.sfpu_op == "ge_int") {
-            // lt/gt/le/ge_int all live in binary_comp.h, gated by the same include macro.
+        } else if (test_config.sfpu_op == "gt_int") {
             sfpu_defines["SFPU_OP_BINARY_GT_INT_INCLUDE"] = "1";
         } else {
             sfpu_defines["SFPU_OP_BINARY_MAX_MIN_INCLUDE"] = "1";
@@ -1516,10 +1494,7 @@ INSTANTIATE_TEST_SUITE_P(
         std::make_tuple(1, "mul_float"),
         std::make_tuple(1, "add_int"),
         std::make_tuple(1, "mul_int"),
-        std::make_tuple(1, "lt_int"),
         std::make_tuple(1, "gt_int"),
-        std::make_tuple(1, "le_int"),
-        std::make_tuple(1, "ge_int"),
         std::make_tuple(1, "binary_max"),
         std::make_tuple(1, "binary_min"),
         std::make_tuple(1, "binary_max_int32"),

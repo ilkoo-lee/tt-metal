@@ -14,22 +14,21 @@
 namespace ckernel {
 
 /**
- * @brief Initialize SFPU for elementwise integer relational compare (lt/gt/le/ge)
+ * @brief Initialize SFPU for elementwise integer greater-than compare
  *
  * @tparam APPROXIMATE: Approximation mode (unused for integer compare)
  * @tparam DATA_FORMAT: Data format of the integer operands
  */
 template <bool APPROXIMATE, DataFormat DATA_FORMAT>
-inline void llk_math_eltwise_binary_sfpu_rel_int_init() {
-    static_assert(DATA_FORMAT == DataFormat::Int32, "Quasar SFPU relational int compare currently supports Int32 only");
+inline void llk_math_eltwise_binary_sfpu_gt_int_init() {
+    static_assert(DATA_FORMAT == DataFormat::Int32, "Quasar SFPU gt_int currently supports Int32 only");
     _llk_math_eltwise_sfpu_init_();
 }
 
 /**
- * @brief Performs elementwise integer relational compare: y = relational_op(x0, x1) ? 1 : 0
+ * @brief Performs elementwise integer greater-than: y = (x0 > x1) ? 1 : 0
  *
  * @tparam APPROXIMATE: Approximation mode (unused for integer compare)
- * @tparam RELATIONAL_OP: Comparison to apply (SfpuType::lt/gt/le/ge)
  * @tparam DATA_FORMAT: Data format of the integer operands
  * @tparam ITERATIONS: Number of iterations for given face
  * @tparam SIGN_MAGNITUDE_FORMAT: Sign-magnitude Int32 encoding for operands and result
@@ -41,21 +40,16 @@ inline void llk_math_eltwise_binary_sfpu_rel_int_init() {
  */
 template <
     bool APPROXIMATE,
-    SfpuType RELATIONAL_OP,
     DataFormat DATA_FORMAT,
     int ITERATIONS = SFPU_ITERATIONS,
     bool SIGN_MAGNITUDE_FORMAT = false>
-inline void llk_math_eltwise_binary_sfpu_rel_int(
+inline void llk_math_eltwise_binary_sfpu_gt_int(
     std::uint32_t idst0, std::uint32_t idst1, std::uint32_t odst, VectorMode vector_mode = VectorMode::RC) {
-    static_assert(DATA_FORMAT == DataFormat::Int32, "Quasar SFPU relational int compare currently supports Int32 only");
-    static_assert(
-        RELATIONAL_OP == SfpuType::lt || RELATIONAL_OP == SfpuType::gt || RELATIONAL_OP == SfpuType::le ||
-            RELATIONAL_OP == SfpuType::ge,
-        "Quasar SFPU relational int compare supports lt, gt, le, ge only");
+    static_assert(DATA_FORMAT == DataFormat::Int32, "Quasar SFPU gt_int currently supports Int32 only");
     LLK_ASSERT(
         vector_mode == VectorMode::R || vector_mode == VectorMode::C || vector_mode == VectorMode::RC ||
             vector_mode == VectorMode::None,
-        "Quasar SFPU relational int compare only supports vector modes R, C, RC, None");
+        "Quasar SFPU gt_int only supports vector modes R, C, RC, None");
 
     constexpr std::uint32_t tile_stride = NUM_FACES * FACE_R_DIM;
     const std::uint32_t in0_offset = idst0 * tile_stride;
@@ -63,7 +57,7 @@ inline void llk_math_eltwise_binary_sfpu_rel_int(
     const std::uint32_t out_offset = odst * tile_stride;
 
     _llk_math_eltwise_binary_sfpu_params_(
-        ckernel::sfpu::calculate_binary_comp_int32<APPROXIMATE, ITERATIONS, RELATIONAL_OP, SIGN_MAGNITUDE_FORMAT>,
+        ckernel::sfpu::calculate_binary_comp_int32<APPROXIMATE, ITERATIONS, SfpuType::gt, SIGN_MAGNITUDE_FORMAT>,
         in0_offset,
         in1_offset,
         out_offset,

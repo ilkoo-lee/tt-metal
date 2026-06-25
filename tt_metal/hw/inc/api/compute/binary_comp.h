@@ -82,31 +82,26 @@ ALWI void rel_int_tile_dispatch(uint32_t idst0, uint32_t idst1, uint32_t odst) {
 }  // namespace detail
 #endif
 
-#if defined(TRISC_MATH) && defined(ARCH_QUASAR)
-namespace detail {
-
-// Quasar dispatch for the integer relational compare. Int8 copy_tile + fp32_dest_acc FPU
-// writes sign-magnitude Int32 into dest; native Int32 tiles use 2's-comp dest, so the LLK
-// kernel decodes sign-magnitude (SIGN_MAGNITUDE_FORMAT=true) before comparing.
-template <SfpuType OP, DataFormat data_format>
-ALWI void rel_int_tile_dispatch(uint32_t idst0, uint32_t idst1, uint32_t odst) {
-    llk_math_eltwise_binary_sfpu_rel_int<APPROX, OP, data_format, 8 /*ITERATIONS*/, true /*SIGN_MAGNITUDE_FORMAT*/>(
-        idst0, idst1, odst);
-}
-
-}  // namespace detail
-#endif
-
+#ifndef ARCH_QUASAR
 template <DataFormat data_format>
 ALWI void lt_int_tile(uint32_t idst0, uint32_t idst1, uint32_t odst) {
     MATH((detail::rel_int_tile_dispatch<SfpuType::lt, data_format>(idst0, idst1, odst)));
 }
+#endif
 
 template <DataFormat data_format>
 ALWI void gt_int_tile(uint32_t idst0, uint32_t idst1, uint32_t odst) {
+#if defined(ARCH_QUASAR)
+    // Int8 copy_tile + fp32_dest_acc FPU writes sign-magnitude Int32 into dest.
+    // Native Int32 tiles use 2's-comp dest and keep SIGN_MAGNITUDE_FORMAT=false.
+    MATH((llk_math_eltwise_binary_sfpu_gt_int<APPROX, data_format, 8 /*ITERATIONS*/, true /*SIGN_MAGNITUDE_FORMAT*/>(
+        idst0, idst1, odst)));
+#else
     MATH((detail::rel_int_tile_dispatch<SfpuType::gt, data_format>(idst0, idst1, odst)));
+#endif
 }
 
+#ifndef ARCH_QUASAR
 template <DataFormat data_format>
 ALWI void le_int_tile(uint32_t idst0, uint32_t idst1, uint32_t odst) {
     MATH((detail::rel_int_tile_dispatch<SfpuType::le, data_format>(idst0, idst1, odst)));
@@ -116,28 +111,27 @@ template <DataFormat data_format>
 ALWI void ge_int_tile(uint32_t idst0, uint32_t idst1, uint32_t odst) {
     MATH((detail::rel_int_tile_dispatch<SfpuType::ge, data_format>(idst0, idst1, odst)));
 }
+#endif
 
 /**
  * The following functions initialize the relational operations. They should be invoked prior to calling the execution
  * API. Please refer to execution API documentation (lt_int_tile/gt_int_tile/le_int_tile/ge_int_tile) to find out more
  * about the relational operations.
  */
+#ifndef ARCH_QUASAR
 template <DataFormat data_format>
 ALWI void lt_int_tile_init() {
-#if defined(ARCH_QUASAR)
-    MATH((llk_math_eltwise_binary_sfpu_rel_int_init<APPROX, data_format>()));
-#else
     static_assert(
         data_format == DataFormat::Int32 || data_format == DataFormat::UInt32 || data_format == DataFormat::UInt16,
         "Unsupported data format for lt_int. Supported data formats are: Int32, UInt32, UInt16");
     MATH((SFPU_BINARY_INIT(lt_int)));
-#endif
 }
+#endif
 
 template <DataFormat data_format>
 ALWI void gt_int_tile_init() {
 #if defined(ARCH_QUASAR)
-    MATH((llk_math_eltwise_binary_sfpu_rel_int_init<APPROX, data_format>()));
+    MATH((llk_math_eltwise_binary_sfpu_gt_int_init<APPROX, data_format>()));
 #else
     static_assert(
         data_format == DataFormat::Int32 || data_format == DataFormat::UInt32 || data_format == DataFormat::UInt16,
@@ -146,28 +140,22 @@ ALWI void gt_int_tile_init() {
 #endif
 }
 
+#ifndef ARCH_QUASAR
 template <DataFormat data_format>
 ALWI void le_int_tile_init() {
-#if defined(ARCH_QUASAR)
-    MATH((llk_math_eltwise_binary_sfpu_rel_int_init<APPROX, data_format>()));
-#else
     static_assert(
         data_format == DataFormat::Int32 || data_format == DataFormat::UInt32 || data_format == DataFormat::UInt16,
         "Unsupported data format for le_int. Supported data formats are: Int32, UInt32, UInt16");
     MATH((SFPU_BINARY_INIT(le_int)));
-#endif
 }
 
 template <DataFormat data_format>
 ALWI void ge_int_tile_init() {
-#if defined(ARCH_QUASAR)
-    MATH((llk_math_eltwise_binary_sfpu_rel_int_init<APPROX, data_format>()));
-#else
     static_assert(
         data_format == DataFormat::Int32 || data_format == DataFormat::UInt32 || data_format == DataFormat::UInt16,
         "Unsupported data format for ge_int. Supported data formats are: Int32, UInt32, UInt16");
     MATH((SFPU_BINARY_INIT(ge_int)));
-#endif
 }
+#endif
 
 }  // namespace ckernel
