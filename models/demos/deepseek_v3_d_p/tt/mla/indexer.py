@@ -342,8 +342,9 @@ class TtIndexer:
 
     def write_k(self, hidden_states: ttnn.Tensor, seq_len: int, start_pos: int):
         """Device K stem (wk + TP all-reduce + k_norm + SP all-gather + device rope),
-        appended to the device index-key cache. Runs on EVERY chunk — dense included —
-        else later DSA chunks score against missing keys for the early prefix."""
+        appended to the device index-key cache. forward() calls this on every chunk so the key-cache
+        stays complete — else later chunks score against missing keys for the early prefix. (Dense v3.1
+        binds a NullIndexer instead, so write_k never runs there.)"""
         k = ttnn.linear(
             hidden_states,
             self._idx_wk,
@@ -368,9 +369,18 @@ class TtIndexer:
         # (update_padded_kv_cache + a gather/un-rotate read like _gather_kvpe_prefix) would avoid that,
         # but it changes the indexer key-cache layout (replicated-natural -> block-cyclic-SP) and the
         # scoring read path, so it is tracked as its own task rather than done here.
-        self._index_kbuf = (
-            k if start_pos == 0 or self._index_kbuf is None else ttnn.concat([self._index_kbuf, k], dim=2)
-        )
+        # The rest of this MLA code manually deallocates intermediate device tensors, so free the device
+        # buffers we drop here too rather than relying on Python ref-loss (which would accumulate device
+        # allocations over a long chunked prefill or across repeated requests).
+        if start_pos == 0 or self._index_kbuf is None:
+            if self._index_kbuf is not None:  # start_pos==0 reset: drop the prior request's full cache
+                ttnn.deallocate(self._index_kbuf)
+            self._index_kbuf = k
+        else:
+            old = self._index_kbuf
+            self._index_kbuf = ttnn.concat([old, k], dim=2)  # concat copies into a fresh buffer...
+            ttnn.deallocate(old)  # ...so the old cache and this chunk's keys are both free to drop
+            ttnn.deallocate(k)
 
     def forward(self, hidden_states: ttnn.Tensor, qr: ttnn.Tensor, seq_len: int, start_pos: int = 0) -> ttnn.Tensor:
         """Indexer forward → top-k key indices [1, 1, S/sp, k] over the device index-key cache, SP-sharded
@@ -380,8 +390,8 @@ class TtIndexer:
         ``qr`` is the shared q_a latent (q_a_proj + TP all-reduce + q_a_layernorm) — ttMLA computes it once
         and passes it in; the indexer applies wq_b to it (no q_a stem of its own). ``qr`` is NOT deallocated
         here — ttMLA's _q_stem consumes it afterwards. ``hidden_states`` is still needed for the K stem
-        (write_k) and the per-head weights (weights_proj). (write_k is also a public entry point: forward
-        calls it, and ttMLA.forward calls it directly on dense chunks to keep the key-cache warm.)"""
+        (write_k) and the per-head weights (weights_proj). (write_k is called internally here; ttMLA.forward
+        only ever calls self._indexer.forward — it never calls write_k directly.)"""
         a = self.index_args
         glob = seq_len * self.sp_factor  # global query/key count this chunk
         end_pos = start_pos + glob
@@ -449,6 +459,9 @@ class TtIndexer:
             logits = ttnn.to_layout(logits, ttnn.ROW_MAJOR_LAYOUT)
         # Top-k key indices [1,1,S/sp,k] (ROW_MAJOR uint32). Future/pad -inf columns surface as the
         # 0xFFFFFFFF sentinel that sparse_mla drops. topk_large_indices: 16 <= k <= 2048, multiple of 16.
+        # index_topk is a multiple of 16, so k is too iff end_pos is — assert it at the caller contract
+        # (current chunk sizing guarantees tile alignment) rather than failing deep inside the op.
+        assert end_pos % 16 == 0, f"indexer top-k requires a tile-aligned key count; got end_pos={end_pos}"
         return ttnn.experimental.topk_large_indices(logits, k=min(self.index_args.index_topk, end_pos))
 
 

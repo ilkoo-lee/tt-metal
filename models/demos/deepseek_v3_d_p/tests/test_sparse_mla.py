@@ -294,6 +294,14 @@ def run_sparse_mla_chunked_case(
 ):
     """Sparse chunked prefill: compare chunked ttMLA against MLACPU sparse chunked truth."""
     # Anchor mesh (TP>=2) and seq/SP validity are guaranteed by _sparse_cases (no runtime skips).
+    #
+    # CACHE-QUANTIZATION NOTE: the CPU reference keeps KVPE in bf16 (build_cpu_reference builds
+    # MLACPU(args, simulate_fp8=False) — see dsa_reference.py), matching the bf16 single-shot device
+    # cache. But the chunked DEVICE path reads the prefix back from the bf8 KVPE cache and upcasts it in
+    # _gather_kvpe_prefix, so this comparison crosses a bf8 cache round-trip the reference does not model.
+    # That quantization noise eats into the SPARSE_OUTPUT_PCC headroom here (vs single-shot). If chunked
+    # PCC ever drifts toward the threshold, add a simulate_fp8=True reference variant to separate expected
+    # cache-quantization noise from a true logic regression.
     seed = 42
     logger.info(
         f"[{variant.name}] sparse MLA chunked start: seq_len={seq_len} chunk={chunk} "

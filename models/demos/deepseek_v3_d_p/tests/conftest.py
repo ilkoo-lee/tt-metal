@@ -10,6 +10,7 @@ Automatically downloads weights from HuggingFace if not available locally.
 
 import json
 import os
+import re
 import shutil
 from functools import lru_cache
 from pathlib import Path
@@ -197,11 +198,10 @@ def download_model_config_only(variant: TestVariant, cache_dir: Path) -> Path:
         # and then looks for its relative-import siblings (e.g. tool_declaration_ts.py) by name in
         # that same dir, which fails in blobs/. Copy into a flat dir of real files so relative
         # imports resolve by name.
-        flat_dir = (
-            cache_dir
-            / "flat_config"
-            / variant.hf_repo_id.replace("/", "__").replace(".", "_").replace("-", "_").replace("_", "-")
-        )
+        # Flatten the repo id to a single safe dir component (drop the "/" path separator). re.sub over
+        # both "/" and "." keeps the name stable without the old self-undoing replace chain (the prior
+        # ". -> _" step was rewritten by a trailing "_ -> -", making it a no-op).
+        flat_dir = cache_dir / "flat_config" / re.sub(r"[/.]", "-", variant.hf_repo_id)
         shutil.copytree(model_dir, flat_dir, symlinks=False, dirs_exist_ok=True)
 
         logger.success(f"✓ Config files downloaded to: {model_dir} (flattened to: {flat_dir})")

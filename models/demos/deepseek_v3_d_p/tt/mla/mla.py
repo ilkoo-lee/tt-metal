@@ -1126,9 +1126,24 @@ class ttMLA:
         cache_layer_idx,
         cache_user_id,
         seq_len_local,
+        actual_end=None,
+        on_layer_complete=None,
         **_,
     ):
         assert indices is not None, "sparse MLA forward requires indexer top-k indices"
+        # Migration is NOT implemented on the sparse chunked path. The dense chunked path zeroes the pad
+        # window past actual_end and fires on_layer_complete for the migration worker; the sparse path has
+        # neither the pad-zeroing nor the layer-complete signaling wired in (and partial-chunk actual_end
+        # handling for the indexer is explicitly out of scope — see sparse_mla_cache_loading_plan.md). Fail
+        # loudly rather than silently no-op the callback (the old `**_` swallowed both arguments), so the
+        # unsupported combination cannot pass review as a working migration path.
+        if on_layer_complete is not None:
+            raise NotImplementedError(
+                "sparse chunked prefill does not support migration (on_layer_complete): the pad-zeroing "
+                "and per-layer migration ack wired into the dense chunked path are not implemented for the "
+                f"sparse path (actual_end={actual_end}). Use the dense chunked path, or run sparse without "
+                "migration (on_layer_complete=None)."
+            )
         start_pos = kv_actual_isl or 0
         end_pos = start_pos + seq_len_local * self.sp_factor
 
