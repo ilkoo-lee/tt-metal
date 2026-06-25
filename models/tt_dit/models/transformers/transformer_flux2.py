@@ -186,10 +186,9 @@ class Flux2SingleTransformerBlock(Module):
         )
 
         x_c_attn, _ = self.attn.forward(
-            spatial_prompt_concat=x_c,
-            spatial_size=spatial_size,
-            combined_rope=combined_rope,
-            spatial_sequence_length=spatial_sequence_length,
+            sequence_1=x_c,
+            sequence_1_rope=combined_rope,
+            sequence_1_length=spatial_sequence_length,
         )
 
         # slice out spatial only. Prompt not needed. The variable names are left to prevent code bloat. But this is just spatial after the slice.
@@ -234,8 +233,6 @@ class Flux2Transformer(Module):
         inner_dim = num_attention_heads * attention_head_dim
         tp_axis = parallel_config.tensor_parallel.mesh_axis
 
-        # self.pos_embed = Flux2PosEmbed(theta=rope_theta, axes_dim=axes_dims_rope)
-
         self.time_guidance_embed = CombinedTimestepGuidanceTextProjEmbeddings(
             embedding_dim=inner_dim,
             pooled_projection_dim=0,
@@ -248,7 +245,6 @@ class Flux2Transformer(Module):
             joint_attention_dim, inner_dim, bias=False, mesh_device=device, mesh_axis=tp_axis
         )
 
-        # Shard output, since size of input dimension << size of output dimension.
         self.x_embedder = ColParallelLinear(in_channels, inner_dim, bias=False, mesh_device=device, mesh_axis=tp_axis)
 
         self.transformer_blocks = ModuleList(
@@ -310,6 +306,7 @@ class Flux2Transformer(Module):
         self._ccl_manager = ccl_manager
         self._tp_axis = tp_axis
         self._tp_factor = parallel_config.tensor_parallel.factor
+        self.pc = parallel_config
 
     def _prepare_torch_state(self, state: dict[str, torch.Tensor]) -> None:
         rename_substate(state, "norm_out.linear", "time_embed_out")
@@ -347,11 +344,13 @@ class Flux2Transformer(Module):
         Args:
             spatial: Tensor with shape [batch_size, spatial_sequence_length / sp_factor, in_channels].
             prompt: Tensor with shape [batch_size, prompt_sequence_length, joint_attention_dim].
-            pooled: Tensor with shape [batch_size, pooled_projection_dim].
             timestep: Tensor with shape [batch_size, 1].
             guidance: Optional tensor with shape [batch_size, 1].
             spatial_rope: Tuple of two tensors with shape [spatial_sequence_length / sp_factor, head_dim].
             prompt_rope: Tuple of two tensors with shape [prompt_sequence_length, head_dim] (sequence is not sharded!).
+            spatial_sequence_length: int.
+            prompt_sequence_length: int.
+            compute_prompt_output: bool. Whether to compute the prompt output. Final prompt output is typically unused.
         """
         time_embed = self.time_guidance_embed(timestep=timestep, guidance=guidance)
         ttnn.silu(time_embed, output_tensor=time_embed)
@@ -400,6 +399,7 @@ class Flux2Transformer(Module):
                 temb_mod_params_img=double_stream_mod_img,
                 temb_mod_params_txt=double_stream_mod_txt,
                 spatial_sequence_length=spatial_sequence_length,
+                prompt_sequence_length=prompt_sequence_length,
                 skip_time_embed_activation_fn=True,
             )
 
@@ -414,6 +414,7 @@ class Flux2Transformer(Module):
         combined_sin_rope = ttnn.concat([spatial_rope[1], prompt_rope[1]], dim=2)
         combined_rope = (combined_cos_rope, combined_sin_rope)
         spatial_size = spatial.shape[1]
+        spatial_prompt_sequence_length = spatial_sequence_length + prompt_sequence_length
         for i, block in enumerate(self.single_transformer_blocks, start=1):
             spatial_prompt_concat = block.forward(
                 spatial_prompt_concat=spatial_prompt_concat,
@@ -421,7 +422,7 @@ class Flux2Transformer(Module):
                 time_embed=time_embed,
                 combined_rope=combined_rope,
                 temb_mod_params=single_stream_mod,
-                spatial_sequence_length=spatial_sequence_length,
+                spatial_sequence_length=spatial_prompt_sequence_length,
                 skip_time_embed_activation_fn=True,
                 compute_prompt_output=(i < num_single_blocks)
                 or compute_prompt_output,  # prompt is unused for the last block.
