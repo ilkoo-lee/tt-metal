@@ -113,9 +113,8 @@ inline __attribute__((always_inline)) sfpi::vBool _zero_comp_pred_(sfpi::vInt v)
             COMP_MODE == SfpuType::less_than_equal_zero || COMP_MODE == SfpuType::greater_than_equal_zero,
         "_zero_comp_pred_: COMP_MODE must be one of the six comparison-to-zero SfpuType modes "
         "(equal_zero/not_equal_zero/less_than_zero/greater_than_zero/less_than_equal_zero/greater_than_equal_zero)");
-    // Clear bit 31 (sign) -> magnitude (±0 -> 0), one SFP op (SFPSETSGN). Route through the
-    // non-deprecated setsgn(vUInt,int) overload (the vInt overload is deprecated); the vUInt->vSMag
-    // and vSMag->vInt reinterprets are free (no instruction), so this stays a single SFPSETSGN.
+    // Clear bit 31 (sign) -> magnitude (±0 -> 0) in a single SFPSETSGN; the vInt<->vSMag
+    // reinterprets are free (no instruction).
     const sfpi::vSMag mag = sfpi::setsgn(sfpi::as<sfpi::vSMag>(v), 0);
 
     if constexpr (COMP_MODE == SfpuType::equal_zero) {
