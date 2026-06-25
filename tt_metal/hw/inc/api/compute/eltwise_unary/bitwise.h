@@ -15,9 +15,9 @@ namespace ckernel {
 // clang-format off
 /**
  * Performs an element-wise bitwise operation between each element of a tile in the DST register at
- * index idst and an immediate scalar param0: y = bitwise(x, param0). The input must be of int data
- * type only. Output overwrites the input tile in DST. The DST register buffer must be in acquired state
- * via *acquire_dst* call. This call is blocking and is only available on the compute engine.
+ * index idst and an immediate scalar param0: y = bitwise(x, param0). The input must be of integer data
+ * type: Int32, UInt32, or UInt16. Output overwrites the input tile in DST. The DST register buffer must be
+ * in acquired state via *acquire_dst* call. This call is blocking and is only available on the compute engine.
  *
  * Return value: None
  *
