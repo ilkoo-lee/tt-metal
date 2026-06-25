@@ -12,7 +12,7 @@ from transformers.configuration_utils import PretrainedConfig
 
 import ttnn
 from models.common.utility_functions import is_blackhole
-from models.demos.deepseek_v3_d_p.tt.mla.indexer import INDEXER_WEIGHT_NAMES, NullIndexer, TtIndexer
+from models.demos.deepseek_v3_d_p.tt.mla.indexer import NullIndexer, TtIndexer, resolve_has_indexer
 from models.demos.deepseek_v3_d_p.tt.mla.mla_config import MLA_MATMUL_CONFIG, MLA_SDPA_CONFIG
 from models.demos.deepseek_v3_d_p.tt.mla.utils import blockcyclic_to_natural
 from models.demos.deepseek_v3_d_p.tt.tt_ccl import get_tt_ccl
@@ -31,14 +31,21 @@ class ttMLA:
     ]
 
     @staticmethod
-    def check_cache_complete(cache_path: Path, cache_name_prefix: str) -> bool:
-        """Check if all 8 MLA weight cache files exist."""
+    def check_cache_complete(cache_path: Path, cache_name_prefix: str, has_indexer: bool = False) -> bool:
+        """Check that the dense MLA weight cache files exist, plus the indexer tensorbins when sparse.
+
+        Dense by default (preserves existing callers). When ``has_indexer=True`` the indexer cache
+        (``{prefix}.indexer_*``) must also be complete — a disjoint prefix space from the dense MLA
+        names, so the dense loop here never matches indexer files and vice versa
+        (see ``TtIndexer.check_cache_complete``)."""
         from models.demos.deepseek_v3_d_p.utils.fast_cache_checker import pattern_exists
 
         for name in ttMLA.MLA_WEIGHT_NAMES:
             if not pattern_exists(f"{cache_name_prefix}.{name}*.tensorbin", "MLA"):
                 logger.debug(f"TTNN cache missing: {cache_name_prefix}.{name}")
                 return False
+        if has_indexer and not TtIndexer.check_cache_complete(cache_path, cache_name_prefix):
+            return False
         return True
 
     @staticmethod
@@ -212,11 +219,25 @@ class ttMLA:
         sp_axis: int = 0,
         tp_axis: int = 1,
         kv_only: bool = False,
+        has_indexer: bool | None = None,
     ):
-        """Build TTNN cache for MLA weights using device=None (no device copy)."""
+        """Build TTNN cache for MLA weights using device=None (no device copy). For DSA-sparse
+        variants also writes the indexer tensorbins. Fails fast if sparse mode is resolved but the
+        host indexer weights are missing — never silently builds a dense-only cache for a sparse layer."""
         ttMLA._convert_and_cache_weights(
             state_dict, mesh_device, config, layer_idx, sp_axis, tp_axis, cache_path, device=None, kv_only=kv_only
         )
+        resolved_has_indexer = resolve_has_indexer(config, state_dict=state_dict, explicit=has_indexer)
+        if resolved_has_indexer:
+            if not TtIndexer.has_host_weights(state_dict):
+                raise ValueError(
+                    f"Sparse MLA cache build for layer {layer_idx} resolved has_indexer=True but the "
+                    f"state dict is missing indexer weights {TtIndexer.WEIGHT_NAMES}. Provide them or "
+                    f"pass has_indexer=False."
+                )
+            TtIndexer.build_ttnn_cache(
+                TtIndexer.extract_host_weights(state_dict), cache_path, mesh_device, config, layer_idx, sp_axis, tp_axis
+            )
 
     def __init__(
         self,
@@ -234,10 +255,14 @@ class ttMLA:
         slot_num: int = 1,
         layer_num: int = 61,
         kv_only: bool = False,
+        has_indexer: bool | None = None,
     ):
-        # DSA indexer weights (v3.2 / GLM) are popped before the v3 weight loader sees them;
-        # absent for dense v3.1 (idx_host empty → _has_indexer False → dense path unchanged).
-        idx_host = {n: state_dict.pop(f"{n}.weight") for n in INDEXER_WEIGHT_NAMES if f"{n}.weight" in state_dict}
+        # DSA indexer weights (v3.2 / GLM): extract NON-mutating, so the caller's state_dict survives
+        # repeated construction / cache build+load (the old pop() emptied it on the first pass). Dense
+        # v3.1 has none. Sparse capability is resolved below via resolve_has_indexer (config DSA fields /
+        # host weights / complete cache) — never from the mere presence of these keys — so cache-only
+        # construction stays sparse instead of silently going dense.
+        idx_host = TtIndexer.extract_host_weights(state_dict)
         self.config = config
         self.mesh_device = mesh_device
         self.layer_idx = layer_idx
@@ -380,17 +405,27 @@ class ttMLA:
             self.o_proj_weight = weights["o_proj"]
         logger.info(f"Loaded {len(weights)} weights in MLA layer {layer_idx} (kv_only={kv_only})")
 
-        # DSA indexer (v3.2 / GLM): construct the TtIndexer when its weights were popped above. It owns
-        # the indexer stems / RoPE tables / device key-cache and reuses this MLA's q_a stem + collectives.
-        # Fully inert for dense v3.1 (idx_host empty → _has_indexer False → dense path unchanged).
-        self._has_indexer = bool(idx_host)
+        # DSA indexer (v3.2 / GLM): resolve sparse mode EXPLICITLY — config DSA fields, then live host
+        # weights, then a complete indexer cache — never from bool(idx_host), which silently went dense
+        # for cache-only construction. The TtIndexer owns the indexer stems / RoPE tables / device
+        # key-cache and reuses this MLA's q_a stem + collectives. Inert for dense v3.1.
+        self._has_indexer = resolve_has_indexer(
+            config,
+            state_dict=state_dict,
+            explicit=has_indexer,
+            weight_cache_path=self.weight_cache_path,
+            cache_name_prefix=f"layer_{layer_idx}.mla",
+        )
         if self._has_indexer:
             # The indexer assumes natural-order SP sharding (contiguous per-chip query blocks: its
             # device RoPE and the indexer_score per-device causal offset both index positions as
             # start_pos + sp_rank*S_local). The balanced chunk reorder breaks that, so guard it.
             assert not self.is_balanced, "DSA indexer requires is_balanced=False (natural-order SP sharding)"
+            # TtIndexer warns (does not raise) if given neither host weights nor a complete cache —
+            # mirroring dense MLA's lenient placeholder load, but loudly. The layer still stays sparse
+            # (binds TtIndexer), so it never silently falls back to dense.
             self._indexer = TtIndexer(
-                idx_host,
+                idx_host if idx_host else None,  # None → TtIndexer loads cache-only placeholders
                 config=config,
                 mesh_device=self.mesh_device,
                 sp_axis=self.sp_axis,

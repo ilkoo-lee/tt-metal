@@ -12,22 +12,171 @@ no reference back to ttMLA (and no MLA weights) and runs its own TP/SP collectiv
 v3.1 (no indexer weights → ttMLA never builds it).
 """
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import torch
+from loguru import logger
 
 import ttnn
 from models.demos.deepseek_v3_d_p.tt.mla.rope import get_cos_sin_matrix, get_rot_transformation_mat
 
-# DSA indexer weights (v3.2 / GLM). When present in the state_dict they are popped before the
-# v3 weight loader (in ttMLA.__init__) and routed here; absent for dense v3.1.
-INDEXER_WEIGHT_NAMES = ("indexer.wq_b", "indexer.wk", "indexer.k_norm", "indexer.k_norm_bias", "indexer.weights_proj")
+# DSA indexer weight names are owned by TtIndexer.WEIGHT_NAMES (single source of truth). A
+# module-level INDEXER_WEIGHT_NAMES alias is defined at the bottom of this file for back-compat.
 
 
 class TtIndexer:
     """DSA lightning indexer for one MLA layer. Self-contained: owns the indexer weights, the
     grown-by-concat device index-key cache and the indexer RoPE tables, and runs its own TP/SP
     collectives. All MLA-layer dependencies it reuses are injected at construction (no ttMLA ref)."""
+
+    # --- DSA ownership: weight names, config-field detection, host/cache API. ttMLA routes all
+    # indexer weight-name / config-field / cache-file / placeholder decisions through these so the
+    # DSA facts live here, not in ttMLA. Mirrors dense ttMLA's check/build/convert cache pattern.
+    WEIGHT_NAMES = (
+        "indexer.wq_b",
+        "indexer.wk",
+        "indexer.k_norm",
+        "indexer.k_norm_bias",
+        "indexer.weights_proj",
+    )
+    # Config fields that mark a runtime config as DSA-sparse (index_rope_interleave is optional and
+    # defaults to False; the three below are the discriminator vs a dense DeepSeek-V3 / R1 config).
+    REQUIRED_CONFIG_FIELDS = ("index_topk", "index_n_heads", "index_head_dim")
+
+    @classmethod
+    def matches_config(cls, config) -> bool:
+        """True iff the runtime config carries the DSA indexer fields (dense R1/V3 lacks them)."""
+        return all(getattr(config, name, None) is not None for name in cls.REQUIRED_CONFIG_FIELDS)
+
+    @classmethod
+    def has_host_weights(cls, state_dict) -> bool:
+        """True iff a live state dict carries all indexer host tensors (from-weights callers)."""
+        return bool(state_dict) and all(f"{n}.weight" in state_dict for n in cls.WEIGHT_NAMES)
+
+    @classmethod
+    def extract_host_weights(cls, state_dict) -> dict:
+        """Non-mutating pull of the indexer host tensors out of a state dict (keyed by WEIGHT_NAMES)."""
+        return {n: state_dict[f"{n}.weight"] for n in cls.WEIGHT_NAMES if f"{n}.weight" in state_dict}
+
+    @staticmethod
+    def _cache_short_name(weight_name: str) -> str:
+        return weight_name.split(".")[-1]  # "indexer.wq_b" -> "wq_b"
+
+    @classmethod
+    def check_cache_complete(cls, cache_path, cache_name_prefix: str) -> bool:
+        """True iff every indexer tensorbin exists under cache_name_prefix (e.g. 'layer_0.mla').
+        Uses a direct ``Path.glob`` (no `init_checker`/global-state dependency) because this also runs
+        at ttMLA construction time — the resolver / __init__ gate — where the global fast-cache checker
+        is not necessarily initialized. It's a one-off per-layer check (5 files), so the batch
+        fast-checker optimization isn't needed here. Indexer files are `{prefix}.indexer_{short}` — a
+        disjoint prefix space from the dense MLA names, so dense and indexer checks never alias."""
+        if cache_path is None:
+            return False
+        cache_path = Path(cache_path)
+        for name in cls.WEIGHT_NAMES:
+            short = cls._cache_short_name(name)
+            if not any(cache_path.glob(f"{cache_name_prefix}.indexer_{short}*.tensorbin")):
+                logger.debug(f"TTNN indexer cache missing: {cache_name_prefix}.indexer_{short}")
+                return False
+        return True
+
+    @classmethod
+    def build_ttnn_cache(
+        cls, idx_host, cache_path, mesh_device, config, layer_idx, sp_axis: int = 0, tp_axis: int = 1
+    ) -> None:
+        """Write the indexer tensorbins to disk (device=None, no device copy)."""
+        cls._convert_and_cache_weights(
+            idx_host, mesh_device, config, layer_idx, sp_axis, tp_axis, cache_path=cache_path, device=None
+        )
+
+    @classmethod
+    def _convert_and_cache_weights(
+        cls, idx_host, mesh_device, config, layer_idx, sp_axis: int = 0, tp_axis: int = 1, cache_path=None, device=None
+    ):
+        """Indexer weights → device (or cache). Mirrors dense MLA's converter:
+        - host tensors present: transpose/shard/replicate and (optionally) write the cache;
+        - `idx_host` falsy + `device=mesh_device`: build `torch.empty()` placeholders in the host
+          (pre-transpose) shapes and rely on existing tensorbins (`as_tensor` ignores the placeholder
+          on a cache hit);
+        - `device=None`: build the cache only, return None.
+        Returns the device-tensor dict keyed by short name (wq_b/wk/weights_proj/k_norm/k_norm_bias),
+        or None when device is None. Cache filenames stay byte-compatible with the previously
+        opportunistic `layer_{i}.mla.indexer_*` files (same dtype/layout/mapper)."""
+        index_n_heads = getattr(config, "index_n_heads", 64)
+        index_head_dim = getattr(config, "index_head_dim", 128)
+        q_lora_rank = config.q_lora_rank
+        hidden_size = config.hidden_size
+
+        def _cache_name(short):
+            return str(cache_path / f"layer_{layer_idx}.mla.indexer_{short}") if cache_path else None
+
+        # A device load with no host weights must be backed by a complete tensorbin set, else
+        # `as_tensor` converts the empty placeholders into garbage indexer weights. Mirror dense MLA's
+        # lenient placeholder load (don't block construction) — but, unlike dense which is silent, WARN
+        # loudly so the misuse is visible. The layer still stays sparse (binds TtIndexer); it does not
+        # fall back to dense. (Build mode, device=None, is gated upstream by ttMLA.build_ttnn_cache.)
+        if not idx_host and device is not None and not cls.check_cache_complete(cache_path, f"layer_{layer_idx}.mla"):
+            logger.warning(
+                f"Sparse MLA layer {layer_idx}: indexer has neither host weights nor a complete cache at "
+                f"{cache_path!r}; loading from empty placeholders — indexer output will be garbage. "
+                f"Build the indexer cache or pass the indexer weights."
+            )
+
+        if idx_host:
+            wq_b = idx_host["indexer.wq_b"]
+            wk = idx_host["indexer.wk"]
+            wproj = idx_host["indexer.weights_proj"]
+            knorm = idx_host["indexer.k_norm"]
+            knorm_b = idx_host["indexer.k_norm_bias"]
+        else:  # cache-only: placeholders in host (pre-transpose) shapes; as_tensor ignores them on a hit
+            wq_b = torch.empty(index_n_heads * index_head_dim, q_lora_rank)
+            wk = torch.empty(index_head_dim, hidden_size)
+            wproj = torch.empty(index_n_heads, hidden_size)
+            knorm = torch.empty(index_head_dim)
+            knorm_b = torch.empty(index_head_dim)
+
+        mem = ttnn.DRAM_MEMORY_CONFIG if device else None
+
+        def repl(t, short):  # k_norm runs on the reduced 128-wide key, so it is replicated across TP
+            return ttnn.as_tensor(
+                t.contiguous().to(torch.bfloat16),
+                device=device,
+                layout=ttnn.TILE_LAYOUT,
+                dtype=ttnn.bfloat16,
+                memory_config=mem,
+                mesh_mapper=ttnn.ReplicateTensorToMesh(mesh_device),
+                cache_file_name=_cache_name(short),
+            )
+
+        def shard(t, axis, short):  # host [out, in] -> device [in, out], dim `axis` sharded across tp
+            dims = [None, None]
+            dims[tp_axis] = axis
+            return ttnn.as_tensor(
+                t.T.contiguous().to(torch.bfloat16),
+                device=device,
+                layout=ttnn.TILE_LAYOUT,
+                dtype=ttnn.bfloat16,
+                memory_config=mem,
+                mesh_mapper=ttnn.ShardTensor2dMesh(mesh_device, mesh_shape=tuple(mesh_device.shape), dims=dims),
+                cache_file_name=_cache_name(short),
+            )
+
+        # wq_b is column-parallel: shard its H_idx*D_idx OUTPUT across tp (each chip builds H_idx/tp
+        # heads; qr is replicated → no reduce). wk / weights_proj contract over hidden (TP-sharded), so
+        # they upload transposed and sharded on that contraction axis → partials reduced by _tp_rs_ag.
+        result = {
+            "wq_b": shard(wq_b, 1, "wq_b"),  # [q_lora_rank, H_idx*D_idx] col-sharded on out
+            "wk": shard(wk, 0, "wk"),  # [dim, D_idx] sharded on dim
+            "weights_proj": shard(wproj, 0, "weights_proj"),  # [dim, H_idx] sharded on dim
+            "k_norm": repl(knorm, "k_norm"),  # [D_idx]
+            "k_norm_bias": repl(knorm_b, "k_norm_bias"),  # [D_idx]
+        }
+        if device is None:
+            for v in result.values():
+                del v
+            return None
+        return result
 
     def __init__(
         self,
@@ -148,62 +297,26 @@ class TtIndexer:
         self._idx_cos, self._idx_sin = repl(cos), repl(sin)
         self._idx_trans = repl(get_rot_transformation_mat()) if interleave else None
 
-    def _upload_weights(self, w):
-        """Indexer weights → device (stems on device, replicated across TP).
-
-        Rides the same on-disk weight cache as the MLA weights: each tensor goes through
-        ``ttnn.as_tensor`` with a ``layer_{idx}.mla.indexer_*`` cache file under the layer's
-        weight_cache_path (same dir + scheme as `_convert_and_cache_weights`), so a second load
-        reads the converted/sharded tensor from disk instead of re-converting on host.
-
-        wk / weights_proj contract over `dim` (hidden is TP-sharded on dim), so they
-        are uploaded transposed and sharded on that contraction axis → matmul yields
-        per-chip partials reduced by _tp_rs_ag. wq_b is column-parallel (sharded on its
-        H_idx*D_idx output) so each chip builds H_idx/tp indexer heads; qr is
-        replicated so no reduce is needed. k_norm runs on the reduced 128-wide key (replicated).
-        """
-
-        def _cache_name(name):
-            cp = self.weight_cache_path
-            return str(cp / f"layer_{self.layer_idx}.mla.indexer_{name}") if cp else None
-
-        def repl(t, name):
-            return ttnn.as_tensor(
-                t.contiguous().to(torch.bfloat16),
-                device=self.mesh_device,
-                layout=ttnn.TILE_LAYOUT,
-                dtype=ttnn.bfloat16,
-                memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh_device),
-                cache_file_name=_cache_name(name),
-            )
-
-        def shard(t, axis, name):  # t [out, in] -> device [in, out], tensor dim `axis` sharded across tp_axis
-            dims = [None, None]
-            dims[self.tp_axis] = axis
-            return ttnn.as_tensor(
-                t.T.contiguous().to(torch.bfloat16),
-                device=self.mesh_device,
-                layout=ttnn.TILE_LAYOUT,
-                dtype=ttnn.bfloat16,
-                memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                mesh_mapper=ttnn.ShardTensor2dMesh(
-                    self.mesh_device, mesh_shape=tuple(self.mesh_device.shape), dims=dims
-                ),
-                cache_file_name=_cache_name(name),
-            )
-
-        def shard_in(t, name):  # device [in, out] sharded on `in` (contraction axis) across tp_axis
-            return shard(t, 0, name)
-
-        # wq_b is column-parallel: shard its H_idx*D_idx OUTPUT across tp so
-        # each chip builds only H_idx/tp indexer heads. qr is replicated, so no reduce is needed; the
-        # per-head logits are summed across tp by an all-reduce after indexer_score (see topk).
-        self._idx_wq_b = shard(w["indexer.wq_b"], 1, "wq_b")  # [q_lora_rank, H_idx*D_idx] col-sharded on out
-        self._idx_wk = shard_in(w["indexer.wk"], "wk")  # [dim, D_idx] sharded on dim
-        self._idx_wproj = shard_in(w["indexer.weights_proj"], "weights_proj")  # [dim, H_idx] sharded on dim
-        self._idx_knorm_w = repl(w["indexer.k_norm"], "k_norm")  # [D_idx]
-        self._idx_knorm_b = repl(w["indexer.k_norm_bias"], "k_norm_bias")  # [D_idx]
+    def _upload_weights(self, idx_host):
+        """Indexer weights → device via the shared converter. `idx_host` may be a full host dict
+        (from-weights) or falsy (cache-only: the converter builds placeholders and reads the
+        `layer_{idx}.mla.indexer_*` tensorbins). The converter also writes the cache opportunistically
+        on a from-weights load, exactly as before."""
+        w = self._convert_and_cache_weights(
+            idx_host,
+            self.mesh_device,
+            self.config,
+            self.layer_idx,
+            self.sp_axis,
+            self.tp_axis,
+            cache_path=self.weight_cache_path,
+            device=self.mesh_device,
+        )
+        self._idx_wq_b = w["wq_b"]
+        self._idx_wk = w["wk"]
+        self._idx_wproj = w["weights_proj"]
+        self._idx_knorm_w = w["k_norm"]
+        self._idx_knorm_b = w["k_norm_bias"]
 
     def _device_rope_pe(self, x: ttnn.Tensor, glob: int, start_pos: int, sp_shard: bool = False) -> ttnn.Tensor:
         """On-device RoPE on the rope half (first 64) of the last dim.
@@ -346,3 +459,32 @@ class NullIndexer:
 
     def forward(self, *args, **kwargs):
         return None
+
+
+# Back-compat alias; TtIndexer.WEIGHT_NAMES is the single source of truth.
+INDEXER_WEIGHT_NAMES = TtIndexer.WEIGHT_NAMES
+
+
+def resolve_has_indexer(config, state_dict=None, explicit=None, weight_cache_path=None, cache_name_prefix=None) -> bool:
+    """Single source of truth for "is this a sparse DSA layer?", used by every ttMLA cache/check/
+    build/load path so they cannot disagree. Resolution order:
+      1. explicit override when not None,
+      2. config.has_indexer when present (absence = unknown, NOT False),
+      3. TtIndexer.matches_config(config) — runtime config carries DSA index_* fields,
+      4. TtIndexer.has_host_weights(state_dict) — live from-weights callers,
+      5. TtIndexer.check_cache_complete(...) — cache-only callers with a complete indexer cache,
+      6. otherwise dense.
+    Never resolve sparse detection through getattr(config, "has_indexer", False): a default-False
+    flag silently disables sparse for cache-only construction (the bug this whole path fixes)."""
+    if explicit is not None:
+        return explicit
+    flag = getattr(config, "has_indexer", None)
+    if flag is not None:
+        return bool(flag)
+    if TtIndexer.matches_config(config):
+        return True
+    if TtIndexer.has_host_weights(state_dict):
+        return True
+    if weight_cache_path is not None and cache_name_prefix is not None:
+        return TtIndexer.check_cache_complete(weight_cache_path, cache_name_prefix)
+    return False

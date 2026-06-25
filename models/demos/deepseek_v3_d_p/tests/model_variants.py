@@ -20,6 +20,7 @@ from typing import Callable, Optional
 from models.demos.deepseek_v3.reference.modeling_deepseek import DeepseekV3Attention as DSv3RefAttention
 from models.demos.deepseek_v3.reference.modeling_deepseek import DeepseekV3Model as DSv3RefModel
 from models.demos.deepseek_v3.reference.modeling_deepseek import DeepseekV3MoE as DSv3RefMoE
+from models.demos.deepseek_v3_d_p.reference.deepseek_v3_2_config import deepseek_v32_hf_config
 from models.demos.deepseek_v3_d_p.reference.deepseek_v3_config import DeepSeekV3Config
 from models.demos.deepseek_v3_d_p.reference.glm_5_1_config import GLM51Config, glm_hf_config, glm_model_args
 from models.demos.deepseek_v3_d_p.reference.kimi_k2_6.modeling_deepseek import DeepseekV3Attention as KimiRefAttention
@@ -146,14 +147,33 @@ KIMI_V2_6 = TestVariant(
 DSV32 = TestVariant(
     name="deepseek_v32",
     env_var="DEEPSEEK_V32_HF_MODEL",
-    # V3.2-Exp shares MLA dims with R1; we resolve config from the R1 checkout to avoid the
-    # uncertainty of loading V3.2-Exp remote code via AutoConfig. The indexer reads its index_*
-    # attrs via getattr-with-defaults that already match DeepSeek, so no extra config wiring.
-    hf_repo_id="deepseek-ai/DeepSeek-R1-0528",
+    # V3.2-Exp config is hand-built (deepseek_v32_hf_config), like GLM: model_type `deepseek_v32` needs
+    # trust_remote_code via AutoConfig, and — unlike a borrowed R1 config — the hand-built one carries
+    # the DSA index_* fields so the sparse resolver (TtIndexer.matches_config) detects it. MLA dims +
+    # YaRN match R1; the indexer is non-interleaved. hf_repo_id is the real V3.2-Exp repo (used only by
+    # the pretrained path below + as the DEEPSEEK_V32_HF_MODEL override target).
+    hf_repo_id="deepseek-ai/DeepSeek-V3.2-Exp",
+    # model_config: a dims class read only by the full-transformer / prefill tests (NUM_DENSE_LAYERS,
+    # NUM_ROUTED_EXPERTS). Kept as DeepSeekV3Config because V3.2 shares R1's MoE dims (256 experts, 3
+    # dense layers). Swap for a V3.2 dims class if/when a V3.2 full-transformer path is wired.
     model_config=DeepSeekV3Config,
-    default_local_path=Path("models/demos/deepseek_v3/reference"),
-    shared_path=Path("/proj_sw/user_dev/deepseek-ai/DeepSeek-R1-0528"),
-    num_layers_to_download=24,
+    # config the device runs on: the hand-built V3.2 HF-attribute config (DSA index_* + YaRN). This is
+    # what config_only resolves to for V3.2 (conftest short-circuits to config_builder).
+    config_builder=deepseek_v32_hf_config,
+    # The MLA truth is MLACPU (reference_kind "mlacpu") with random/CPU weights, so the sparse tests
+    # never load pretrained HF weights — the pretrained path is disabled.
+    supports_pretrained=False,
+    # --- Pretrained-weight resolution (DISABLED) -------------------------------------------------
+    # These locate an on-disk HF checkout (config.json + safetensors index + shards) for the pretrained
+    # path; order is env_var -> default_local_path -> shared_path -> download hf_repo_id.
+    # num_layers_to_download bounds the HF download to the first N layers' shards (+embeddings+norm), so
+    # the full ~600GB model isn't pulled. All unused while supports_pretrained=False. To enable a V3.2
+    # pretrained / full-model path: set supports_pretrained=True, point these at a real DeepSeek-V3.2-Exp
+    # checkout (NOT an R1 one — V3.2 ships the indexer weights R1 lacks), and add a test that requests
+    # the pretrained_transformer_weights / state_dict / model_path fixtures.
+    # default_local_path=Path("/path/to/DeepSeek-V3.2-Exp"),
+    # shared_path=Path("/proj_sw/user_dev/deepseek-ai/DeepSeek-V3.2-Exp"),
+    # num_layers_to_download=24,
     # Block / full-model parity is out of P0 scope; the MLA truth comes from MLACPU, not HF attn.
     reference_model_cls=None,
     reference_attention_cls=None,
