@@ -8,6 +8,8 @@ path separate while reusing the same TT execution helper and the production mesh
 / fabric axes from the dense MLA tests.
 """
 
+import os
+
 import pytest
 import torch
 from loguru import logger
@@ -39,34 +41,71 @@ from tests.ttnn.utils_for_testing import assert_with_pcc
 
 SPARSE_OUTPUT_PCC = 0.98
 SPARSE_KVPE_PCC = 0.99
-SPARSE_SEQ_LENS = [pytest.param(256, marks=pytest.mark.dev), 2048, 4096]
-SPARSE_SEQ_IDS = ["seq256", "seq2k", "seq4k"]
+# seq_len is a sparsity-regime axis, not a code-path axis: the dense/sparse op graph is bound at
+# construction (mla.py), not by seq_len. We keep one point each side of the indexer TOPK (2048):
+# seq256 (top-k selects all available keys -> sparse == dense numerically; also the `dev` fast point)
+# and seq4k (top-k actually prunes). 2048 is dropped (also inert, redundant with seq256).
+SPARSE_SEQ_LENS = [pytest.param(256, marks=pytest.mark.dev), 4096]
+SPARSE_SEQ_IDS = ["seq256", "seq4k"]
 SPARSE_VARIANTS = ["deepseek_v32", "glm_5_1"]
 
-# Sparse MLA hardware mesh coverage. Includes Galaxy production (8x4), a TP=4 case (2x4), and TP=2
-# shapes so GLM (tp<=2) is exercised: 4x2 is the LoudBox full-box TP=2 shape (reliable on an 8-chip
-# box), 2x2 a smaller TP=2 case. (A bare sub-mesh smaller than the physical box — e.g. 2x2 on a
-# LoudBox — may not train fabric links; 4x2 fills the whole 8-chip box and is the dependable GLM mesh.)
-SPARSE_MESH_PARAMS = [(8, 4), (2, 4), (4, 2), (2, 2)]
-SPARSE_MESH_IDS = ["8x4", "2x4", "4x2", "2x2"]
+# Sparse MLA hardware mesh coverage. Galaxy production (8x4), a TP=4 case (2x4), and the LoudBox
+# full-box TP=2 shape (4x2) so GLM (tp_cap<=2) is exercised. The 2x2 sub-mesh was dropped: it is the
+# least prod-like shape and, as a bare sub-mesh smaller than the physical box, may not train fabric
+# links reliably. Accuracy sweeps the full set (mesh shape is NOT correctness-invariant); determinism
+# and chunked pin to the per-variant anchor (see skip_if_not_anchor_mesh).
+SPARSE_MESH_PARAMS = [(8, 4), (2, 4), (4, 2)]
+SPARSE_MESH_IDS = ["8x4", "2x4", "4x2"]
 
-SPARSE_DEVICE_PARAMS = [
-    {
+# All three fabric transports, keyed by name. Fabric is NOT swept: correctness is ~invariant to the
+# transport, so the suite pins one fabric (PREFERRED below) and lets a dedicated fabric test cover
+# multi-transport bring-up. The ids/dicts are kept so DS_SPARSE_FABRIC can select any of them.
+_SPARSE_FABRICS = {
+    "line": {
         "fabric_config": ttnn.FabricConfig.FABRIC_1D,
         "worker_l1_size": ttnn._ttnn.device.DEFAULT_WORKER_L1_SIZE if is_blackhole() else WH_WORKER_L1_SIZE,
     },
-    {
+    "ring": {
         "fabric_config": ttnn.FabricConfig.FABRIC_1D_RING,
         "worker_l1_size": ttnn._ttnn.device.DEFAULT_WORKER_L1_SIZE if is_blackhole() else WH_WORKER_L1_SIZE,
     },
-    {
+    "fabric2d": {
         "fabric_config": ttnn.FabricConfig.FABRIC_2D,
         "fabric_router_config": create_fabric_router_config(max_payload_size=get_max_payload_size()),
         "reliability_mode": ttnn.FabricReliabilityMode.RELAXED_INIT,
         "worker_l1_size": ttnn._ttnn.device.DEFAULT_WORKER_L1_SIZE if is_blackhole() else WH_WORKER_L1_SIZE,
     },
-]
-SPARSE_DEVICE_IDS = ["line", "ring", "fabric2d"]
+}
+# Auto-pin the fabric: priority fabric2d > ring > line (fabric2d is the Galaxy/production bring-up).
+# Override with DS_SPARSE_FABRIC=line|ring|fabric2d. TODO: replace the priority default with a real
+# per-box capability probe; for now it defaults to the top-priority (production) transport.
+_SPARSE_FABRIC_PRIORITY = ["fabric2d", "ring", "line"]
+
+
+def _preferred_fabric_name() -> str:
+    env = os.environ.get("DS_SPARSE_FABRIC")
+    if env:
+        assert env in _SPARSE_FABRICS, f"DS_SPARSE_FABRIC={env!r} must be one of {sorted(_SPARSE_FABRICS)}"
+        return env
+    return _SPARSE_FABRIC_PRIORITY[0]
+
+
+PREFERRED_FABRIC = _preferred_fabric_name()
+SPARSE_DEVICE_PARAMS = [_SPARSE_FABRICS[PREFERRED_FABRIC]]
+SPARSE_DEVICE_IDS = [PREFERRED_FABRIC]
+
+# determinism + chunked pin to the variant's production-closest mesh: the highest TP the variant
+# supports (DeepSeek TP=4 -> e.g. (2,4); GLM tp_cap=2 -> (4,2)). The accuracy test owns the SP x TP
+# sweep, so these intent tests need only the single prod-anchor shape per variant.
+SPARSE_ANCHOR_MAX_TP = 4
+
+
+def skip_if_not_anchor_mesh(variant, mesh_device) -> None:
+    tp = list(mesh_device.shape)[1]
+    cap = getattr(variant, "tp_cap", None)
+    anchor_tp = min(SPARSE_ANCHOR_MAX_TP, cap) if cap else SPARSE_ANCHOR_MAX_TP
+    if tp != anchor_tp:
+        pytest.skip(f"{variant.name!r}: determinism/chunked pinned to TP={anchor_tp} anchor mesh (got TP={tp})")
 
 
 def _topology_from_device_params(device_params):
@@ -160,6 +199,7 @@ def run_sparse_mla_determinism_case(
     """Run the same sparse MLA case repeatedly and compare outputs."""
     skip_if_seq_too_small_for_sp(seq_len, mesh_device)
     skip_if_tp_exceeds_cap(variant, mesh_device)
+    skip_if_not_anchor_mesh(variant, mesh_device)
 
     logger.info(
         f"[{variant.name}] sparse MLA determinism start: seq_len={seq_len} "
@@ -223,6 +263,7 @@ def run_sparse_mla_chunked_case(
     """Sparse chunked prefill: compare chunked ttMLA against MLACPU sparse chunked truth."""
     skip_if_seq_too_small_for_sp(seq_len, mesh_device)
     skip_if_tp_exceeds_cap(variant, mesh_device)
+    skip_if_not_anchor_mesh(variant, mesh_device)
     if mesh_device.shape[1] == 1:
         pytest.skip("chunked MLA epilogue exceeds L1 without TP head-sharding (TP=1)")
 
