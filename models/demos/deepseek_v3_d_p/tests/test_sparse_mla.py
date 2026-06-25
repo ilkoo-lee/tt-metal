@@ -25,11 +25,8 @@ from models.demos.deepseek_v3_d_p.tests.dsa_reference import (
     run_cpu_reference,
     run_cpu_reference_chunked,
 )
-from models.demos.deepseek_v3_d_p.tests.mesh_utils import (
-    skip_if_seq_too_small_for_sp,
-    skip_if_tp1_dense_mla,
-    skip_if_tp_exceeds_cap,
-)
+from models.demos.deepseek_v3_d_p.tests.mesh_utils import KVPE_MIN_TOKENS_PER_CHIP, detect_num_devices
+from models.demos.deepseek_v3_d_p.tests.model_variants import TEST_VARIANTS
 from models.demos.deepseek_v3_d_p.tests.test_mla import run_mla_inference
 from models.demos.deepseek_v3_d_p.tt.mla import ttMLA
 from models.demos.deepseek_v3_d_p.tt.mla.rope import RotarySetup
@@ -49,13 +46,76 @@ SPARSE_SEQ_LENS = [pytest.param(256, marks=pytest.mark.dev), 4096]
 SPARSE_SEQ_IDS = ["seq256", "seq4k"]
 SPARSE_VARIANTS = ["deepseek_v32", "glm_5_1"]
 
-# Sparse MLA hardware mesh coverage. Galaxy production (8x4), a TP=4 case (2x4), and the LoudBox
-# full-box TP=2 shape (4x2) so GLM (tp_cap<=2) is exercised. The 2x2 sub-mesh was dropped: it is the
-# least prod-like shape and, as a bare sub-mesh smaller than the physical box, may not train fabric
-# links reliably. Accuracy sweeps the full set (mesh shape is NOT correctness-invariant); determinism
-# and chunked pin to the per-variant anchor (see skip_if_not_anchor_mesh).
-SPARSE_MESH_PARAMS = [(8, 4), (2, 4), (4, 2)]
-SPARSE_MESH_IDS = ["8x4", "2x4", "4x2"]
+# ---------------------------------------------------------------------------
+# TEST MATRIX — single source of truth (see _sparse_cases for how it expands)
+# ---------------------------------------------------------------------------
+# Box-adaptive candidate meshes (sp, tp), keyed by physical device count. Each box lists ONLY shapes
+# that fit it, so off-box shapes are never generated (no "needs N devices" skips). Shapes must be
+# TP>=2 (the dense 128-head epilogue overflows L1 at TP=1). Coverage rationale:
+#   QuietBox (4):  (2,2) TP=2 for GLM + DeepSeek; (1,4) gives DeepSeek a TP=4 point (GLM tp_cap=2).
+#   LoudBox  (8):  (2,4) TP=4 and (4,2) TP=2 (the full-box GLM shape).
+#   Galaxy   (32): (8,4) production TP=4 + (8,2) TP=2 plane so GLM is exercised.
+# Mesh shape is NOT correctness-invariant, so accuracy sweeps the whole box set; determinism and
+# chunked pin to each variant's anchor (highest supported TP) — see _sparse_cases(anchor_only=True).
+SPARSE_MESH_BY_DEVICES = {
+    4: [(2, 2), (1, 4)],
+    8: [(2, 4), (4, 2)],
+    32: [(8, 4), (8, 2)],
+}
+
+# seq_len is a sparsity-regime axis (not a code path): accuracy keeps one inert-top-k point (256, also
+# the `dev` fast point, where sparse == dense) and one real-pruning point (4096). determinism/chunked
+# use the single prod-closest length (4096). 2048 dropped (also inert, redundant with 256).
+SPARSE_SEQS_ACCURACY = [256, 4096]
+SPARSE_SEQS_ANCHOR = [4096]
+SPARSE_DEV_SEQ = 256  # tagged `dev` for the fast inner loop
+
+
+def _sparse_meshes():
+    """Current box's candidate (sp, tp) meshes; best-effort single TP plane on non-standard boxes."""
+    n = detect_num_devices()
+    return SPARSE_MESH_BY_DEVICES.get(n, [(1, max(n, 1))])
+
+
+def _mesh_ok_for_variant(variant_name, mesh):
+    # sparse_sdpa needs per-chip n_heads/tp >= 32, so GLM (64 heads) caps at TP=2 (tp_cap=2).
+    cap = getattr(TEST_VARIANTS[variant_name], "tp_cap", None)
+    return cap is None or mesh[1] <= cap
+
+
+def _seq_ok_for_mesh(seq_len, mesh):
+    # kvpe ND-shard cache needs >= KVPE_MIN_TOKENS_PER_CHIP tokens per SP shard.
+    return seq_len // mesh[0] >= KVPE_MIN_TOKENS_PER_CHIP
+
+
+def _anchor_mesh(variant_name, meshes):
+    """Production-closest mesh for a variant: the highest TP it supports among the box's meshes."""
+    return max((m for m in meshes if _mesh_ok_for_variant(variant_name, m)), key=lambda m: m[1])
+
+
+def _sparse_cases(seqs, anchor_only):
+    """Generate (variant, mesh, seq_len) params for the CURRENT box — only valid combos, so the
+    collected matrix equals the run matrix (validity is enforced here, not via runtime skips)."""
+    meshes = _sparse_meshes()
+    cases = []
+    for variant_name in SPARSE_VARIANTS:
+        usable = [m for m in meshes if _mesh_ok_for_variant(variant_name, m)]
+        chosen = [_anchor_mesh(variant_name, meshes)] if (anchor_only and usable) else usable
+        for mesh in chosen:
+            for seq_len in seqs:
+                if not _seq_ok_for_mesh(seq_len, mesh):
+                    continue
+                marks = (pytest.mark.dev,) if seq_len == SPARSE_DEV_SEQ else ()
+                cases.append(
+                    pytest.param(
+                        variant_name, mesh, seq_len, marks=marks, id=f"{variant_name}-{mesh[0]}x{mesh[1]}-seq{seq_len}"
+                    )
+                )
+    return cases
+
+
+SPARSE_ACCURACY_CASES = _sparse_cases(SPARSE_SEQS_ACCURACY, anchor_only=False)
+SPARSE_ANCHOR_CASES = _sparse_cases(SPARSE_SEQS_ANCHOR, anchor_only=True)
 
 # All three fabric transports, keyed by name. Fabric is NOT swept: correctness is ~invariant to the
 # transport, so the suite pins one fabric (PREFERRED below) and lets a dedicated fabric test cover
@@ -94,19 +154,6 @@ PREFERRED_FABRIC = _preferred_fabric_name()
 SPARSE_DEVICE_PARAMS = [_SPARSE_FABRICS[PREFERRED_FABRIC]]
 SPARSE_DEVICE_IDS = [PREFERRED_FABRIC]
 
-# determinism + chunked pin to the variant's production-closest mesh: the highest TP the variant
-# supports (DeepSeek TP=4 -> e.g. (2,4); GLM tp_cap=2 -> (4,2)). The accuracy test owns the SP x TP
-# sweep, so these intent tests need only the single prod-anchor shape per variant.
-SPARSE_ANCHOR_MAX_TP = 4
-
-
-def skip_if_not_anchor_mesh(variant, mesh_device) -> None:
-    tp = list(mesh_device.shape)[1]
-    cap = getattr(variant, "tp_cap", None)
-    anchor_tp = min(SPARSE_ANCHOR_MAX_TP, cap) if cap else SPARSE_ANCHOR_MAX_TP
-    if tp != anchor_tp:
-        pytest.skip(f"{variant.name!r}: determinism/chunked pinned to TP={anchor_tp} anchor mesh (got TP={tp})")
-
 
 def _topology_from_device_params(device_params):
     return (
@@ -120,10 +167,8 @@ def run_sparse_mla_accuracy_case(
     variant, config, mesh_device, seq_len, topology, ds_layer=None, ds_checkpoint=None, ds_repo=None
 ):
     """Sparse-MLA accuracy: device output + KVPE cache vs MLACPU sparse reference."""
-    skip_if_seq_too_small_for_sp(seq_len, mesh_device)
-    skip_if_tp1_dense_mla(seq_len, mesh_device)
-    skip_if_tp_exceeds_cap(variant, mesh_device)
-
+    # Validity (tp<=cap, seq/sp>=min tokens, off-box shapes) is enforced by _sparse_cases at
+    # collection time, so there are no runtime skips here: collected == run.
     logger.info(
         f"[{variant.name}] sparse MLA accuracy start: seq_len={seq_len} "
         f"mesh={tuple(mesh_device.shape)} topology={topology}"
@@ -197,10 +242,7 @@ def run_sparse_mla_determinism_case(
     variant, config, mesh_device, seq_len, n_runs, topology, ds_layer, ds_checkpoint, ds_repo
 ):
     """Run the same sparse MLA case repeatedly and compare outputs."""
-    skip_if_seq_too_small_for_sp(seq_len, mesh_device)
-    skip_if_tp_exceeds_cap(variant, mesh_device)
-    skip_if_not_anchor_mesh(variant, mesh_device)
-
+    # Mesh is the per-variant anchor and seq fits SP — guaranteed by _sparse_cases (no runtime skips).
     logger.info(
         f"[{variant.name}] sparse MLA determinism start: seq_len={seq_len} "
         f"mesh={tuple(mesh_device.shape)} topology={topology} n_runs={n_runs}"
@@ -261,12 +303,7 @@ def run_sparse_mla_chunked_case(
     variant, config, mesh_device, seq_len, chunk, ds_layer, ds_checkpoint, ds_repo, ds_input
 ):
     """Sparse chunked prefill: compare chunked ttMLA against MLACPU sparse chunked truth."""
-    skip_if_seq_too_small_for_sp(seq_len, mesh_device)
-    skip_if_tp_exceeds_cap(variant, mesh_device)
-    skip_if_not_anchor_mesh(variant, mesh_device)
-    if mesh_device.shape[1] == 1:
-        pytest.skip("chunked MLA epilogue exceeds L1 without TP head-sharding (TP=1)")
-
+    # Anchor mesh (TP>=2) and seq/SP validity are guaranteed by _sparse_cases (no runtime skips).
     seed = 42
     logger.info(
         f"[{variant.name}] sparse MLA chunked start: seq_len={seq_len} chunk={chunk} "
@@ -357,10 +394,10 @@ def run_sparse_mla_chunked_case(
     logger.info(f"[{variant.name}] sparse MLA chunked complete")
 
 
-@pytest.mark.parametrize("mesh_device", SPARSE_MESH_PARAMS, ids=SPARSE_MESH_IDS, indirect=True)
+# One combined parametrization (variant, mesh_device, seq_len) instead of three independent axes: the
+# cases are generated by _sparse_cases for the current box, so the collected matrix IS the run matrix.
+@pytest.mark.parametrize("variant, mesh_device, seq_len", SPARSE_ACCURACY_CASES, indirect=["variant", "mesh_device"])
 @pytest.mark.parametrize("device_params", SPARSE_DEVICE_PARAMS, ids=SPARSE_DEVICE_IDS, indirect=True)
-@pytest.mark.parametrize("seq_len", SPARSE_SEQ_LENS, ids=SPARSE_SEQ_IDS)
-@pytest.mark.parametrize("variant", SPARSE_VARIANTS, indirect=True, ids=SPARSE_VARIANTS)
 @pytest.mark.accuracy
 @pytest.mark.mesh
 @pytest.mark.gate
@@ -373,11 +410,10 @@ def test_sparse_mla_accuracy(
     run_sparse_mla_accuracy_case(variant, config_only, mesh_device, seq_len, topology, ds_layer, ds_checkpoint, ds_repo)
 
 
-@pytest.mark.parametrize("mesh_device", SPARSE_MESH_PARAMS, ids=SPARSE_MESH_IDS, indirect=True)
+# Anchor cases (per-variant prod-closest mesh, seq=4096); collected == run.
+@pytest.mark.parametrize("variant, mesh_device, seq_len", SPARSE_ANCHOR_CASES, indirect=["variant", "mesh_device"])
 @pytest.mark.parametrize("device_params", SPARSE_DEVICE_PARAMS, ids=SPARSE_DEVICE_IDS, indirect=True)
-@pytest.mark.parametrize("seq_len", [4096], ids=["seq4k"])
 @pytest.mark.parametrize("n_runs", [3], ids=["x3"])
-@pytest.mark.parametrize("variant", SPARSE_VARIANTS, indirect=True, ids=SPARSE_VARIANTS)
 @pytest.mark.determinism
 @pytest.mark.dev
 @pytest.mark.skipif(not is_blackhole(), reason="DSA ops (indexer / sparse SDPA) are Blackhole-only")
@@ -391,10 +427,10 @@ def test_sparse_mla_determinism(
     )
 
 
-@pytest.mark.parametrize("mesh_device", SPARSE_MESH_PARAMS, ids=SPARSE_MESH_IDS, indirect=True)
+# Anchor cases (seq=4096) crossed with the single prefill chunk size; collected == run.
+@pytest.mark.parametrize("variant, mesh_device, seq_len", SPARSE_ANCHOR_CASES, indirect=["variant", "mesh_device"])
 @pytest.mark.parametrize("device_params", SPARSE_DEVICE_PARAMS, ids=SPARSE_DEVICE_IDS, indirect=True)
-@pytest.mark.parametrize("seq_len,chunk", [(4096, 1024)], ids=["4k_c1k"])
-@pytest.mark.parametrize("variant", SPARSE_VARIANTS, indirect=True, ids=SPARSE_VARIANTS)
+@pytest.mark.parametrize("chunk", [1024], ids=["c1k"])
 @pytest.mark.feature_chunking
 @pytest.mark.feature_cache
 @pytest.mark.gate
