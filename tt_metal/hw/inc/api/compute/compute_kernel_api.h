@@ -175,6 +175,39 @@ ALWI void silu_tile_init() {
 #endif
 }
 
+// clang-format off
+/**
+ * Performs element-wise computation of square value on each element of a tile
+ * in DST register at index tile_index. The DST register buffer must be in
+ * acquired state via *acquire_dst* call. This call is blocking and is only
+ * available on the compute engine.
+ *
+ * Return value: None
+ *
+ * | Argument        | Description                                                                | Type     | Valid Range                                           | Required |
+ * |-----------------|----------------------------------------------------------------------------|----------|-------------------------------------------------------|----------|
+ * | idst            | The index of the tile in DST register buffer to perform the computation on | uint32_t | Must be less than the size of the DST register buffer | True     |
+ */
+// clang-format on
+ALWI void square_tile(uint32_t idst) {
+#ifndef ARCH_QUASAR
+    MATH(SFPU_UNARY_CALL(DST_SYNC_MODE, DST_ACCUM_MODE, calculate_square, (APPROX), idst, VectorMode::RC));
+#else
+    MATH(SFPU_UNARY_CALL(DST_SYNC_MODE, DST_ACCUM_MODE, calculate_square, (SFPU_ITERATIONS), idst, VectorMode::RC));
+#endif
+}
+
+/**
+ * Please refer to documentation for any_init.
+ */
+ALWI void square_tile_init() {
+#ifndef ARCH_QUASAR
+    MATH(SFPU_UNARY_INIT(square));
+#else
+    MATH(SFPU_UNARY_INIT(square, sfpu::init_square));
+#endif
+}
+
 #ifndef ARCH_QUASAR
 
 template <bool fast_and_approx = false>
@@ -443,41 +476,6 @@ ALWI void sign_tile(uint32_t idst) {
  * Please refer to documentation for any_init.
  */
 ALWI void sign_tile_init() { MATH(SFPU_UNARY_INIT(sign)); }
-#endif  // !ARCH_QUASAR (square is available on Quasar; reopened after square_tile_init)
-
-// clang-format off
-/**
- * Performs element-wise computation of square value on each element of a tile
- * in DST register at index tile_index. The DST register buffer must be in
- * acquired state via *acquire_dst* call. This call is blocking and is only
- * available on the compute engine.
- *
- * Return value: None
- *
- * | Argument        | Description                                                                | Type     | Valid Range                                           | Required |
- * |-----------------|----------------------------------------------------------------------------|----------|-------------------------------------------------------|----------|
- * | idst            | The index of the tile in DST register buffer to perform the computation on | uint32_t | Must be less than the size of the DST register buffer | True     |
- */
-// clang-format on
-ALWI void square_tile(uint32_t idst) {
-#ifndef ARCH_QUASAR
-    MATH(SFPU_UNARY_CALL(DST_SYNC_MODE, DST_ACCUM_MODE, calculate_square, (APPROX), idst, VectorMode::RC));
-#else
-    MATH(SFPU_UNARY_CALL(DST_SYNC_MODE, DST_ACCUM_MODE, _calculate_square_, (SFPU_ITERATIONS), idst, VectorMode::RC));
-#endif
-}
-
-/**
- * Please refer to documentation for any_init.
- */
-ALWI void square_tile_init() {
-#ifndef ARCH_QUASAR
-    MATH(SFPU_UNARY_INIT(square));
-#else
-    MATH((llk_math_eltwise_unary_sfpu_init<SfpuType::square>(sfpu::_init_square_)));
-#endif
-}
-#ifndef ARCH_QUASAR
 
 // clang-format off
 /**
