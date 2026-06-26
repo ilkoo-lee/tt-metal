@@ -295,6 +295,60 @@ SliceDeviceOperation::program_factory_t SliceDeviceOperation::select_program_fac
     return SliceTileProgramFactory{};
 }
 
+ttsl::hash::hash_t SliceDeviceOperation::compute_program_hash(
+    const operation_attributes_t& operation_attributes, const tensor_args_t& tensor_args) {
+    // The default hash only walks operation_attributes fields and tensor_args metadata, but the
+    // underlying hash combiner (boost::hash_combine-style) has weak distribution for small
+    // integer sequences — different shapes can collide.  This was first observed for concat in
+    // issue #45089 (fixed via PR #45144) and later triggered for slice in issue #47602.
+    //
+    // The fix: override compute_program_hash to mix in the input tensor's full shape and the
+    // computed output spec so that any two invocations whose core-grid size would differ are
+    // guaranteed to produce distinct keys.
+    auto factory = select_program_factory(operation_attributes, tensor_args);
+    auto hash = tt::tt_metal::operation::hash_operation<SliceDeviceOperation>(
+        operation_attributes.slice_dim,
+        operation_attributes.num_devices,
+        operation_attributes.output_mem_config,
+        operation_attributes.sub_core_grids,
+        factory.index(),
+        tensor_args.start_tensor.has_value());
+
+    const auto& input = tensor_args.input;
+    hash = ttsl::hash::hash_objects(
+        hash,
+        input.logical_shape().rank(),
+        input.logical_shape(),
+        input.padded_shape(),
+        input.layout(),
+        input.dtype(),
+        input.memory_config());
+
+    if (tensor_args.start_tensor.has_value()) {
+        const auto& st = tensor_args.start_tensor.value();
+        hash = ttsl::hash::hash_objects(
+            hash,
+            st.logical_shape().rank(),
+            st.logical_shape(),
+            st.padded_shape(),
+            st.layout(),
+            st.dtype(),
+            st.memory_config());
+    }
+
+    const auto output_spec = compute_output_specs(operation_attributes, tensor_args);
+    hash = ttsl::hash::hash_objects(
+        hash,
+        output_spec.logical_shape().rank(),
+        output_spec.logical_shape(),
+        output_spec.padded_shape(),
+        output_spec.layout(),
+        output_spec.data_type(),
+        output_spec.memory_config());
+
+    return hash;
+}
+
 tt::tt_metal::operation::OpPerformanceModelGeneral<SliceDeviceOperation::tensor_return_value_t>
 SliceDeviceOperation::create_op_performance_model(
     const operation_attributes_t& /*args*/, const tensor_args_t& tensor_args, const Tensor& output) {

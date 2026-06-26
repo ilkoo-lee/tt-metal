@@ -1505,6 +1505,73 @@ def test_issue_42753_regression(device, input_shape, begins, ends, step):
     assert_with_pcc(torch_output, tt_output_torch, 0.99)
 
 
+def test_issue_47602_program_cache_collision_on_shape_change(device):
+    """Regression test for issue #47602.
+
+    ttnn.slice crashed with TT_FATAL when called back-to-back with two different
+    input shapes inside the same process (program cache enabled).  The root cause
+    is the same as concat issue #45089: the default compute_program_hash uses a
+    boost::hash_combine-style combiner that has weak distribution over small
+    integer sequences, so two structurally different shapes can hash to the same
+    key.  When the second (larger) invocation falsely hits the first (smaller)
+    entry the framework tries to apply a descriptor whose runtime-arg core list is
+    wider than the cached program's kernel placement, triggering:
+
+        TT_FATAL: Cannot get runtime args for kernel
+        slice_reader_unary_unpad_dims_rm_interleaved_start_id
+        that is not placed on core 0-1
+
+    The fix: override compute_program_hash on SliceDeviceOperation to mix in the
+    input tensor's full shape (rank + logical + padded), layout, dtype, memory
+    config, and the computed output spec, guaranteeing distinct keys whenever the
+    core-grid size differs.
+
+    This test exercises the exact crash pattern (small shape → cache entry, then
+    larger shape → must be a cache-miss, not a spurious hit) for both ROW_MAJOR
+    and TILE layouts.
+    """
+    torch.manual_seed(47602)
+
+    def _to_tt(t, layout, device):
+        return ttnn.from_torch(
+            t,
+            dtype=ttnn.bfloat16,
+            layout=layout,
+            device=device,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
+
+    # ── ROW_MAJOR path ──────────────────────────────────────────────────────
+    # "decode"-size: 1 core; "prefill"-size: many more cores.
+    small_rm = torch.rand(1, 1, 32, 64, dtype=torch.bfloat16)
+    large_rm = torch.rand(1, 4, 512, 512, dtype=torch.bfloat16)
+
+    tt_small_rm = _to_tt(small_rm, ttnn.ROW_MAJOR_LAYOUT, device)
+    tt_large_rm = _to_tt(large_rm, ttnn.ROW_MAJOR_LAYOUT, device)
+
+    # First call — populates cache entry.
+    tt_out_small_rm = ttnn.slice(tt_small_rm, [0, 0, 0, 0], [1, 1, 32, 32], memory_config=ttnn.DRAM_MEMORY_CONFIG)
+    # Second call — must be a cache-miss (different shape needs more cores).
+    # Before the fix this would TT_FATAL.
+    tt_out_large_rm = ttnn.slice(tt_large_rm, [0, 0, 0, 0], [1, 4, 256, 256], memory_config=ttnn.DRAM_MEMORY_CONFIG)
+
+    assert_with_pcc(small_rm[:, :, :, :32], ttnn.to_torch(tt_out_small_rm), 0.9999)
+    assert_with_pcc(large_rm[:, :, :256, :256], ttnn.to_torch(tt_out_large_rm), 0.9999)
+
+    # ── TILE path ───────────────────────────────────────────────────────────
+    small_tile = torch.rand(1, 1, 32, 64, dtype=torch.bfloat16)
+    large_tile = torch.rand(1, 4, 512, 512, dtype=torch.bfloat16)
+
+    tt_small_tile = _to_tt(small_tile, ttnn.TILE_LAYOUT, device)
+    tt_large_tile = _to_tt(large_tile, ttnn.TILE_LAYOUT, device)
+
+    tt_out_small_tile = ttnn.slice(tt_small_tile, [0, 0, 0, 0], [1, 1, 32, 32], memory_config=ttnn.DRAM_MEMORY_CONFIG)
+    tt_out_large_tile = ttnn.slice(tt_large_tile, [0, 0, 0, 0], [1, 4, 256, 256], memory_config=ttnn.DRAM_MEMORY_CONFIG)
+
+    assert_with_pcc(small_tile[:, :, :, :32], ttnn.to_torch(tt_out_small_tile), 0.9999)
+    assert_with_pcc(large_tile[:, :, :256, :256], ttnn.to_torch(tt_out_large_tile), 0.9999)
+
+
 @pytest.mark.parametrize(
     "shape, slice_start, slice_end",
     [
