@@ -35,8 +35,8 @@ using namespace ckernel::packer;
  */
 inline void _llk_pack_fast_tilize_addrmod_config_(const std::uint32_t unit_dim)
 {
-    // first two address mods move to the next row, the stride depends on the number of contiguous faces loaded in the single unpacker instruction
-    // for unit_dim 1, that is 2 so the stride is 2, and analogously for unit_dims 2 and 3 its 4 and 6
+    // ADDR_MOD_0 moves to the next row; its stride depends on the number of contiguous faces loaded in the single unpacker instruction:
+    // unit_dim 1 -> stride 2, unit_dim 2 and 3 -> stride 4 (ADDR_MOD_0). The stride-6 step for the 3-tile unit lives in ADDR_MOD_2 below.
     if (unit_dim == 1)
     {
         addr_mod_pack_t {

@@ -207,12 +207,10 @@ inline void _llk_unpack_AB_init_(const ckernel::TensorShape tensor_shape, const 
 /**
  * @brief Uninitialize unpacker after AB unpacking operations
  *
- * Resets the unpacker address counters for both SrcA and SrcB to their default
- * tile element counts based on the provided tensor shapes.
+ * Intentional no-op: the SrcA/SrcB unpacker address-counter state is reprogrammed by the next
+ * @ref _llk_unpack_AB_init_, so no explicit restore is required here.
  *
- * @param unpA_tensor_shape: Tensor shape for source A operand
- * @param unpB_tensor_shape: Tensor shape for source B operand
- * @note Call @ref _llk_unpack_AB_init_ before this function.
+ * @note Call @ref _llk_unpack_AB_init_ before re-unpacking.
  */
 inline void _llk_unpack_AB_uninit_()
 {

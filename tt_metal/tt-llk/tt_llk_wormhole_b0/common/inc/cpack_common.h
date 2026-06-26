@@ -353,7 +353,7 @@ inline void set_packer_strides(const std::uint32_t pack_src_format)
     std::uint32_t x_stride = (pack_src_format & 0x3) == to_underlying(DataFormat::Float32)   ? 4
                              : (pack_src_format & 0x3) == to_underlying(DataFormat::Float16) ? 2
                                                                                              : 1;
-    std::uint32_t y_stride = FACE_R_DIM * x_stride;
+    std::uint32_t y_stride = FACE_C_DIM * x_stride; // Y steps across a row of FACE_C_DIM datums (== FACE_R_DIM for square faces)
     std::uint32_t z_stride = FACE_C_DIM * y_stride;
     std::uint32_t w_stride = TILE_NUM_FACES * z_stride;
 
@@ -563,6 +563,12 @@ inline void reconfigure_exp_threshold(const std::uint32_t pack_dst_format)
     }
 
     constexpr std::uint32_t THRESHOLD_RMW_MASK = THCON_SEC0_REG1_Exp_threshold_en_MASK | THCON_SEC0_REG1_Exp_threshold_MASK;
+
+    // Exp_threshold{,_en} live in word +3 of the REG1/REG8 register groups; assert that layout so the +3 offset stays valid.
+    static_assert(THCON_SEC0_REG1_Row_start_section_size_ADDR32 + 3 == THCON_SEC0_REG1_Exp_threshold_ADDR32);
+    static_assert(THCON_SEC1_REG1_Row_start_section_size_ADDR32 + 3 == THCON_SEC1_REG1_Exp_threshold_ADDR32);
+    static_assert(THCON_SEC0_REG8_Row_start_section_size_ADDR32 + 3 == THCON_SEC0_REG8_Exp_threshold_ADDR32);
+    static_assert(THCON_SEC1_REG8_Row_start_section_size_ADDR32 + 3 == THCON_SEC1_REG8_Exp_threshold_ADDR32);
 
     std::uint32_t threshold_rmw_data = (threshold << THCON_SEC0_REG1_Exp_threshold_SHAMT) | (enable << THCON_SEC0_REG1_Exp_threshold_en_SHAMT);
 
@@ -811,7 +817,6 @@ inline void program_packer_destination(std::uint32_t addr, bool restore = true)
     TT_SETDMAREG(0, LOWER_HALFWORD(addr), 0, LO_16(p_gpr_pack::OUTPUT_ADDR));
     TT_SETDMAREG(0, UPPER_HALFWORD(new_l1_addr), 0, HI_16(p_gpr_pack::OUTPUT_ADDR));
 
-    // TTI_STALLWAIT(p_stall::STALL_THCON, p_stall::PACK);
     TTI_REG2FLOP(1, 0, 0, 0, THCON_SEC0_REG1_L1_Dest_addr_ADDR32 - THCON_CFGREG_BASE_ADDR32, p_gpr_pack::OUTPUT_ADDR);
 
     TTI_PACR(ADDR_MOD_2, 0, 0xf, 0, 0, 1, 0); // pack flush
@@ -829,6 +834,8 @@ inline void program_packer_untilized_destination(const std::uint32_t addr, const
 
     if constexpr (diagonal)
     {
+        // Diagonal untilize drives only packers 0 and 1; the offset2/offset3 + packer-2/3 (SEC1) lines below are
+        // intentionally disabled and kept as reference for a possible 4-packer extension.
         const std::uint32_t block_size  = SCALE_DATUM_SIZE(pack_dst_format, FACE_C_DIM);
         constexpr std::uint32_t offset0 = 0;
         const std::uint32_t offset1     = (1 * block_size) / 16;
